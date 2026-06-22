@@ -1,18 +1,17 @@
-"""Attachment-independent edge BPE for directed labeled trees.
+"""Attachment-independent edge BPE for schema-1 directed labeled trees.
 
-Fitting consumes only topology plus node ``label``, ``size``, and ``time``.
-Candidate frequencies are raw counts of ``(parent_label, child_label)`` edges;
-attachment maps play no role in rule learning.  During transformation the
-actual occurrence attachment map is retained in an exact :class:`CompositeType`
-so stage-local decoding remains lossless.
+The learning and compact contraction core is preserved from v0.12.1. Schema-1
+adaptation is isolated to graph normalization, exact occurrence capture, stage
+metadata, and fitted artifact construction.
 """
 
 from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
-from collections.abc import Callable, Hashable as HashableABC, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass, field
+from numbers import Real
 from typing import Any, Literal
 
 import networkx as nx
@@ -20,30 +19,83 @@ import networkx as nx
 from ..coarsener import TreeCoarsener
 from ..decoder import TreeDecoder
 from ..encoder import EncodingRule, TreeEncoder
-from ..exceptions import ValidationError
-from ..nx_io import edge_attach_attrs
-from ..provenance import (
-    NODE_ATTRS_KEY,
-    PROVENANCE_KEY,
-    copy_graph_provenance,
-    get_node_attrs_by_uid,
-    provenance_from_raw_graph,
+from ..exceptions import (
+    ConfigurationError,
+    FittingSizeError,
+    LabelMetadataError,
+    ValidationError,
 )
+from ..provenance import PROVENANCE_KEY, normalize_provenance
 from ..schema import (
-    RAW_INPUT_FLAG,
+    FITTING_SIZES_KEY,
+    SCHEMA_KEY,
+    append_stage,
     encoded_node_attrs,
-    max_component_time,
-    normalize_coarsenable_tree,
+    fit_corpus_fitting_sizes,
+    get_graph_fitting_sizes,
+    normalize_attach_map,
+    normalize_schema_record,
+    prepare_graph,
 )
 from ..stage_decoder import StructuralStageDecoder
-from ..structural import CompositeType, infer_input_alphabet, structural_root_count
-from ..validation import validate_coarsenable_tree, validate_encoded_tree
-from ..vocabulary import Token, TokenSpec, Vocabulary, normalize_attach_map
+from ..structural import CompositeType, ExactType, is_base_type
+from ..validation import validate_encoded_tree
 
+Token = Hashable
 EdgeKey = tuple[int, int]
 PairScoreFunction = Callable[[int, int, int, int, int], float]
 PairScoreName = Literal["count", "normalized", "size_weighted"]
 PairScore = PairScoreName | PairScoreFunction
+
+
+def max_component_time(*values: float) -> float:
+    return max(float(value) for value in values)
+
+
+def _has_raw_occurrence_geometry(graph: nx.DiGraph) -> bool:
+    """Return whether visible occurrences are unchanged one-site raw nodes.
+
+    A no-op stage still appends lineage metadata under schema 1.0.  That metadata
+    must not by itself switch BPE to the historical encoded-node ordering and
+    thereby change overlap selection.  The check is deliberately confined to
+    the graph adapter; the compact BPE algorithm remains unchanged.
+    """
+
+    return all(
+        is_base_type(data.get("type"))
+        and data.get("size") == 1
+        and isinstance(data.get("super_uids"), tuple)
+        and len(data["super_uids"]) == 1
+        for _, data in graph.nodes(data=True)
+    )
+
+
+def _stable_uid_order_key(value: Any) -> tuple[Any, ...]:
+    """Order recommended primitive/tuple UIDs without comparing unlike types."""
+
+    if value is None:
+        return ("none",)
+    if isinstance(value, bool):
+        return ("bool", int(value))
+    if isinstance(value, int):
+        return ("int", value)
+    if isinstance(value, float):
+        return ("float", value.hex())
+    if isinstance(value, str):
+        return ("str", value)
+    if isinstance(value, bytes):
+        return ("bytes", value)
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_stable_uid_order_key(item) for item in value))
+    if isinstance(value, frozenset):
+        return (
+            "frozenset",
+            tuple(sorted(_stable_uid_order_key(item) for item in value)),
+        )
+    return (
+        f"object:{type(value).__module__}.{type(value).__qualname__}",
+        repr(value),
+    )
 
 
 def count_pair_score(
@@ -75,9 +127,7 @@ def normalized_pair_score(
 
     del s_a, s_b
     if n_a <= 0 or n_b <= 0:
-        raise ValidationError(
-            "normalized pair score requires positive endpoint occurrence counts."
-        )
+        raise ValidationError("normalized pair score requires positive endpoint occurrence counts.")
     return float(n_ab) / math.sqrt(float(n_a) * float(n_b))
 
 
@@ -88,7 +138,7 @@ def size_weighted_pair_score(
     s_a: int,
     s_b: int,
 ) -> float:
-    """Return ``N(A,B) * (S(A) + S(B))``."""
+    """Return ``N(A,B) * (S(A) + S(B))`` using label fitting sizes."""
 
     del n_a, n_b
     return float(n_ab) * float(s_a + s_b)
@@ -118,22 +168,19 @@ class _PairSelection:
     score: float
 
 
-def edge_bpe_token(rank: int) -> tuple[str, int]:
-    """Stable generic fitting label for the ``rank``-th edge-BPE rule."""
+def edge_bpe_token(model_id: str, rank: int) -> tuple[str, str, int]:
+    """Return the stage-namespaced matching label for one BPE rule."""
 
-    if rank < 0:
-        raise ValidationError("edge-BPE rank must be nonnegative.")
-    return ("edge_bpe", int(rank))
+    if not isinstance(model_id, str) or not model_id:
+        raise ValidationError("edge-BPE model_id must be a nonempty string.")
+    if not isinstance(rank, int) or isinstance(rank, bool) or rank < 0:
+        raise ValidationError("edge-BPE rank must be a nonnegative integer.")
+    return ("edge_bpe", model_id, int(rank))
 
 
 @dataclass(frozen=True, slots=True)
 class EdgeBPERule:
-    """One learned label-pair contraction rule.
-
-    ``count`` is the raw number of matching live edges at selection time,
-    including overlapping occurrences.  Attachment maps are intentionally
-    absent: they affect exact transform types, not fitting statistics.
-    """
+    """One learned label-pair contraction rule."""
 
     rank: int
     token: Token
@@ -146,7 +193,38 @@ class EdgeBPERule:
     parent_size: int | None = None
     child_size: int | None = None
 
-    # Compatibility aliases used by earlier examples/tests.
+    def __post_init__(self) -> None:
+        if not isinstance(self.rank, int) or isinstance(self.rank, bool) or self.rank < 0:
+            raise ConfigurationError("edge-BPE rank must be a nonnegative integer.")
+        for name, value in (
+            ("token", self.token),
+            ("parent_label", self.parent_label),
+            ("child_label", self.child_label),
+        ):
+            try:
+                hash(value)
+            except Exception as exc:
+                raise ConfigurationError(
+                    f"edge-BPE {name} must be hashable; got {value!r}."
+                ) from exc
+        if not isinstance(self.count, int) or isinstance(self.count, bool) or self.count <= 0:
+            raise ConfigurationError("edge-BPE count must be a positive integer.")
+        if self.score is not None:
+            if not isinstance(self.score, Real) or isinstance(self.score, bool):
+                raise ConfigurationError("edge-BPE score must be a finite real or None.")
+            if not math.isfinite(float(self.score)):
+                raise ConfigurationError("edge-BPE score must be a finite real or None.")
+        for name, value in (
+            ("parent_count", self.parent_count),
+            ("child_count", self.child_count),
+            ("parent_size", self.parent_size),
+            ("child_size", self.child_size),
+        ):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            ):
+                raise ConfigurationError(f"edge-BPE {name} must be a positive integer or None.")
+
     @property
     def parent_token(self) -> Token:
         return self.parent_label
@@ -211,15 +289,29 @@ class _UidRope:
 
 
 @dataclass(slots=True)
+class _BPEVocabulary:
+    fitting_sizes: dict[Token, int]
+
+    def fitting_size(self, label: Token) -> int:
+        try:
+            return self.fitting_sizes[label]
+        except KeyError as exc:
+            raise LabelMetadataError(f"no fitting size is registered for label {label!r}.") from exc
+
+    def add_fitting_size(self, label: Token, size: int) -> None:
+        previous = self.fitting_sizes.get(label)
+        if previous is not None and previous != size:
+            raise ValidationError(
+                f"label {label!r} has conflicting fitting sizes {previous} and {size}."
+            )
+        self.fitting_sizes[label] = size
+
+
+@dataclass(slots=True)
 class _OutputContext:
-    label_attr: str
-    type_attr: str
-    size_attr: str
-    time_attr: str
-    super_label_attr: str
-    super_uid_attr: str
-    attach_attr: str
     model_id: str
+    schema: dict[str, Any]
+    fitting_sizes: dict[Token, int]
     provenance: dict[str, Any]
     uid_rope: _UidRope
 
@@ -237,16 +329,16 @@ def _bump_count(counts: Counter[EdgeKey], key: EdgeKey, delta: int) -> None:
 def _initial_label_statistics(
     states: Sequence["_CompactEdgeTree"],
     codec: _TokenCodec,
-    vocab: Vocabulary,
+    vocab: _BPEVocabulary,
 ) -> tuple[list[int], list[int]]:
-    """Return dense occurrence-count and fixed-size arrays by label id."""
+    """Return dense occurrence counts and fitting sizes by label id."""
 
     label_counts = [0] * len(codec.id_to_token)
     for state in states:
         for node, is_alive in enumerate(state.alive):
             if is_alive:
                 label_counts[state.label[node]] += 1
-    label_sizes = [vocab.site_count(codec.decode(i)) for i in range(len(codec.id_to_token))]
+    label_sizes = [vocab.fitting_size(codec.decode(i)) for i in range(len(codec.id_to_token))]
     return label_counts, label_sizes
 
 
@@ -290,13 +382,7 @@ def _update_label_counts_after_merge(
 
 @dataclass(slots=True)
 class _CompactEdgeTree:
-    """Mutable array-backed state shared by fitting and transformation.
-
-    Fit-time state contains only ``parent``, ``children``, integer ``label``,
-    ``size``, ``time``, liveness, and the label-pair index.  Output-only exact
-    types, nested provenance, UIDs, root counts, and attachment maps are retained
-    only when ``capture_output=True``.
-    """
+    """Mutable array-backed state shared by fitting and transformation."""
 
     parent: list[int]
     children: list[list[int]]
@@ -305,39 +391,32 @@ class _CompactEdgeTree:
     time: list[float]
     alive: list[bool]
     codec: _TokenCodec
-    vocab: Vocabulary
+    vocab: _BPEVocabulary
     edge_index: dict[EdgeKey, set[int]] = field(default_factory=lambda: defaultdict(set))
 
     output: _OutputContext | None = None
-    type_token: list[Token] | None = None
-    super_label: list[Any] | None = None
+    type_token: list[ExactType] | None = None
     uid_ref: list[int] | None = None
-    root_count: list[int] | None = None
     attach_to_parent: list[tuple[int, ...]] | None = None
 
     @classmethod
     def from_graph(
         cls,
-        G: nx.DiGraph,
+        graph: nx.DiGraph,
         *,
         codec: _TokenCodec,
-        vocab: Vocabulary,
-        label_attr: str = "label",
-        type_attr: str = "type",
-        size_attr: str = "size",
-        time_attr: str = "time",
-        uid_attr: str = "uid",
-        super_label_attr: str = "super_label",
-        super_uid_attr: str = "super_uids",
-        attach_attr: str = "attach_map",
+        vocab: _BPEVocabulary,
         model_id: str = "",
         pair_counts: Counter[EdgeKey] | None = None,
         capture_output: bool = False,
         build_edge_index: bool = True,
+        input_is_normalized_raw: bool | None = None,
     ) -> "_CompactEdgeTree":
-        roots = [node for node in G if G.in_degree(node) == 0]
+        roots = [node for node in graph if graph.in_degree(node) == 0]
         if len(roots) != 1:
             raise ValidationError(f"expected exactly one root; found {len(roots)}.")
+        if input_is_normalized_raw is None:
+            input_is_normalized_raw = _has_raw_occurrence_geometry(graph)
 
         root = roots[0]
         order: list[Any] = [root]
@@ -346,18 +425,28 @@ class _CompactEdgeTree:
         children: list[list[int]] = [[]]
 
         def child_key(child: Any) -> tuple[Any, ...]:
-            data = G.nodes[child]
+            data = graph.nodes[child]
+            uids = data["super_uids"]
+            semantic_tie: Any
+            if input_is_normalized_raw:
+                # Preserve the v0.12.1 raw-input ordering exactly.
+                semantic_tie = repr(uids[0])
+            else:
+                # Earlier encoded graphs used synthetic integer node IDs here.
+                # A structural UID key preserves their usual numeric ordering
+                # without making schema-1 correctness depend on node keys.
+                semantic_tie = _stable_uid_order_key(uids)
             return (
-                float(data[time_attr]),
-                repr(data[label_attr]),
-                repr(data.get(uid_attr, child)),
+                float(data["time"]),
+                repr(data["label"]),
+                semantic_tie,
                 repr(child),
             )
 
         cursor = 0
         while cursor < len(order):
             node = order[cursor]
-            for child in sorted(G.successors(node), key=child_key):
+            for child in sorted(graph.successors(node), key=child_key):
                 if child in seen:
                     raise ValidationError(f"node {child!r} is reachable more than once.")
                 child_i = len(order)
@@ -367,56 +456,40 @@ class _CompactEdgeTree:
                 children.append([])
                 children[cursor].append(child_i)
             cursor += 1
-        if len(order) != G.number_of_nodes():
+        if len(order) != graph.number_of_nodes():
             raise ValidationError("not every node is reachable from the directed root.")
 
-        labels = [codec.intern(G.nodes[node][label_attr]) for node in order]
-        sizes = [int(G.nodes[node][size_attr]) for node in order]
-        times = [float(G.nodes[node][time_attr]) for node in order]
+        labels = [codec.intern(graph.nodes[node]["label"]) for node in order]
+        sizes = [int(graph.nodes[node]["size"]) for node in order]
+        times = [float(graph.nodes[node]["time"]) for node in order]
         alive = [True] * len(order)
 
         output: _OutputContext | None = None
-        types: list[Token] | None = None
-        super_labels: list[Any] | None = None
+        types: list[ExactType] | None = None
         uid_ref: list[int] | None = None
-        roots_per_node: list[int] | None = None
         attachments: list[tuple[int, ...]] | None = None
-
         if capture_output:
-            types = [G.nodes[node][type_attr] for node in order]
-            super_labels = [G.nodes[node][super_label_attr] for node in order]
-            uid_leaves = [tuple(G.nodes[node][super_uid_attr]) for node in order]
+            types = [graph.nodes[node]["type"] for node in order]
+            uid_leaves = [tuple(graph.nodes[node]["super_uids"]) for node in order]
             uid_rope = _UidRope(uid_leaves)
             uid_ref = list(range(len(order)))
-            roots_per_node = []
             attachments = []
             for i, node in enumerate(order):
                 p = parent[i]
                 if p == -1:
-                    roots_per_node.append(structural_root_count(types[i], vocab))
                     attachments.append(())
                 else:
-                    edge_map = normalize_attach_map(
-                        G.edges[order[p], node][attach_attr]
+                    attachments.append(
+                        normalize_attach_map(
+                            graph.edges[order[p], node]["attach_map"],
+                            context=f"edge {(order[p], node)!r}",
+                        )
                     )
-                    roots_per_node.append(len(edge_map))
-                    attachments.append(edge_map)
-
-            provenance = G.graph.get(PROVENANCE_KEY)
-            if isinstance(provenance, dict) and get_node_attrs_by_uid(G):
-                provenance_payload = provenance
-            else:
-                provenance_payload = provenance_from_raw_graph(G, uid_attr=uid_attr)
             output = _OutputContext(
-                label_attr=label_attr,
-                type_attr=type_attr,
-                size_attr=size_attr,
-                time_attr=time_attr,
-                super_label_attr=super_label_attr,
-                super_uid_attr=super_uid_attr,
-                attach_attr=attach_attr,
                 model_id=model_id,
-                provenance=provenance_payload,
+                schema=normalize_schema_record(graph.graph[SCHEMA_KEY]),
+                fitting_sizes=get_graph_fitting_sizes(graph),
+                provenance=normalize_provenance(graph.graph[PROVENANCE_KEY]),
                 uid_rope=uid_rope,
             )
 
@@ -431,9 +504,7 @@ class _CompactEdgeTree:
             vocab=vocab,
             output=output,
             type_token=types,
-            super_label=super_labels,
             uid_ref=uid_ref,
-            root_count=roots_per_node,
             attach_to_parent=attachments,
         )
         if build_edge_index:
@@ -552,20 +623,14 @@ class _CompactEdgeTree:
             self._remove_edge(current, pair_counts=pair_counts)
 
         parent_size = self.size[parent_node]
-        parent_label_token = self.codec.decode(self.label[parent_node])
-        child_label_token = self.codec.decode(self.label[child_node])
         self.label[parent_node] = new_label
         self.size[parent_node] += self.size[child_node]
-        self.time[parent_node] = max_component_time(
-            self.time[parent_node], self.time[child_node]
-        )
+        self.time[parent_node] = max_component_time(self.time[parent_node], self.time[child_node])
 
         if self.output is not None:
             if (
                 self.type_token is None
-                or self.super_label is None
                 or self.uid_ref is None
-                or self.root_count is None
                 or self.attach_to_parent is None
                 or rule_token is None
             ):
@@ -573,31 +638,17 @@ class _CompactEdgeTree:
             parent_type = self.type_token[parent_node]
             child_type = self.type_token[child_node]
             contracted_map = self.attach_to_parent[child_node]
-            exact_type = CompositeType(
+            self.type_token[parent_node] = CompositeType(
                 model_id=self.output.model_id,
-                kind="edge_bpe",
                 label=rule_token,
                 parent=(-1, 0),
-                component_labels=(parent_label_token, child_label_token),
-                component_types=(parent_type, child_type),
-                component_sizes=(parent_size, self.size[child_node]),
-                component_root_counts=(
-                    self.root_count[parent_node],
-                    self.root_count[child_node],
-                ),
+                components=(parent_type, child_type),
                 attach=contracted_map,
-            )
-            self.type_token[parent_node] = exact_type
-            self.super_label[parent_node] = (
-                self.super_label[parent_node],
-                self.super_label[child_node],
             )
             self.uid_ref[parent_node] = self.output.uid_rope.merge(
                 self.uid_ref[parent_node], self.uid_ref[child_node]
             )
             self.uid_ref[child_node] = -1
-            # The new token inherits the parent's exposed roots and incoming map.
-            self.root_count[parent_node] = self.root_count[parent_node]
 
         for current in child_children:
             self.parent[current] = parent_node
@@ -619,11 +670,10 @@ class _CompactEdgeTree:
         for current in remaining:
             self._add_edge(current, pair_counts=pair_counts)
 
-    def to_networkx(self, *, validate: bool = True) -> nx.DiGraph:
+    def to_networkx(self, *, validate: str | bool = "full") -> nx.DiGraph:
         if (
             self.output is None
             or self.type_token is None
-            or self.super_label is None
             or self.uid_ref is None
             or self.attach_to_parent is None
         ):
@@ -631,93 +681,179 @@ class _CompactEdgeTree:
         context = self.output
         live = [node for node, keep in enumerate(self.alive) if keep]
         mapping = {old: new for new, old in enumerate(live)}
-        H = nx.DiGraph()
-        H.graph[PROVENANCE_KEY] = context.provenance
-        H.graph[RAW_INPUT_FLAG] = False
-        H.graph["tree_coarsening_schema"] = {
-            "schema_version": "0.3",
-            "model_id": context.model_id,
-            "node_label_semantics": "fit symbol",
-            "node_type_semantics": "exact structural variant",
-        }
+        out = nx.DiGraph()
+        out.graph[SCHEMA_KEY] = context.schema
+        out.graph[FITTING_SIZES_KEY] = dict(context.fitting_sizes)
+        out.graph[PROVENANCE_KEY] = context.provenance
         for old in live:
-            uids = context.uid_rope.flatten(self.uid_ref[old])
-            H.add_node(
+            out.add_node(
                 mapping[old],
                 **encoded_node_attrs(
                     label=self.codec.decode(self.label[old]),
-                    type_token=self.type_token[old],
+                    type=self.type_token[old],
                     size=self.size[old],
                     time=self.time[old],
-                    super_label=self.super_label[old],
-                    super_uids=uids,
-                    label_attr=context.label_attr,
-                    type_attr=context.type_attr,
-                    size_attr=context.size_attr,
-                    time_attr=context.time_attr,
-                    super_label_attr=context.super_label_attr,
-                    super_uid_attr=context.super_uid_attr,
+                    super_uids=context.uid_rope.flatten(self.uid_ref[old]),
                 ),
             )
         for old_child in live:
             old_parent = self.parent[old_child]
             if old_parent == -1:
                 continue
-            H.add_edge(
+            out.add_edge(
                 mapping[old_parent],
                 mapping[old_child],
-                **edge_attach_attrs(
-                    self.attach_to_parent[old_child],
-                    attach_attr=context.attach_attr,
-                ),
+                attach_map=self.attach_to_parent[old_child],
             )
-        if validate:
-            validate_encoded_tree(
-                H,
-                vocab=self.vocab,
-                label_attr=context.label_attr,
-                type_attr=context.type_attr,
-                size_attr=context.size_attr,
-                time_attr=context.time_attr,
-                super_label_attr=context.super_label_attr,
-                super_uid_attr=context.super_uid_attr,
-                attach_attr=context.attach_attr,
-            )
-        return H
+        validate_encoded_tree(out, level=validate)
+        return out
 
 
-@dataclass
 class EdgeBPEEncoder(TreeEncoder):
     """Apply fitted label-pair rules with occurrence-specific exact types."""
 
-    edge_rules: tuple[EdgeBPERule, ...] = ()
-
-    def encode(self, G: nx.DiGraph, *, validate: bool = True) -> nx.DiGraph:
-        G = normalize_coarsenable_tree(
-            G,
-            label_attr=self.label_attr,
-            type_attr=self.type_attr,
-            size_attr=self.size_attr,
-            time_attr=self.time_attr,
-            uid_attr=self.uid_attr,
-            super_label_attr=self.super_label_attr,
-            super_uid_attr=self.super_uid_attr,
-            attach_attr=self.attach_attr,
-            copy=True,
-        )
-        if validate:
-            validate_coarsenable_tree(
-                G,
-                label_attr=self.label_attr,
-                type_attr=self.type_attr,
-                size_attr=self.size_attr,
-                time_attr=self.time_attr,
-                super_label_attr=self.super_label_attr,
-                super_uid_attr=self.super_uid_attr,
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        rules: Sequence[EncodingRule],
+        edge_rules: Sequence[EdgeBPERule],
+        input_labels: Sequence[Token],
+    ) -> None:
+        super().__init__(model_id=model_id, rules=rules)
+        edge_rules = tuple(edge_rules)
+        input_labels = tuple(input_labels)
+        if len(edge_rules) != len(self.rules):
+            raise ConfigurationError(
+                "EdgeBPEEncoder generic rules and edge rules must have equal lengths."
             )
+        if len(set(input_labels)) != len(input_labels):
+            raise ConfigurationError("EdgeBPEEncoder input_labels must be unique.")
+        available_labels = set(input_labels)
+        for expected_rank, (rule, edge_rule) in enumerate(zip(self.rules, edge_rules, strict=True)):
+            if not isinstance(edge_rule, EdgeBPERule):
+                raise ConfigurationError("edge_rules must contain EdgeBPERule values.")
+            if edge_rule.rank != expected_rank:
+                raise ConfigurationError(
+                    f"edge-BPE rule ranks must be consecutive; expected {expected_rank}, "
+                    f"got {edge_rule.rank}."
+                )
+            expected_token = edge_bpe_token(model_id, expected_rank)
+            if edge_rule.token != expected_token or rule.output_label != expected_token:
+                raise ConfigurationError(
+                    f"edge-BPE rule {expected_rank} output label is not its stage-namespaced token."
+                )
+            if (
+                edge_rule.parent_label not in available_labels
+                or edge_rule.child_label not in available_labels
+            ):
+                raise ConfigurationError(
+                    f"edge-BPE rule {expected_rank} references a label unavailable at "
+                    "that point in the ordered program."
+                )
+            if rule.operation != "edge":
+                raise ConfigurationError(
+                    f"edge-BPE rule {expected_rank} must use operation='edge'."
+                )
+            expected_pattern_keys = {
+                "parent_label",
+                "child_label",
+                "count_semantics",
+                "raw_count",
+                "actual_events",
+                "pair_score",
+                "parent_count",
+                "child_count",
+            }
+            if set(rule.pattern) != expected_pattern_keys:
+                raise ConfigurationError(
+                    f"edge-BPE rule {expected_rank} generic pattern disagrees with the "
+                    "schema-1 artifact contract."
+                )
+            if rule.parameter_names:
+                raise ConfigurationError(
+                    f"edge-BPE rule {expected_rank} must not declare parametric fields."
+                )
+            if (
+                rule.pattern["parent_label"] != edge_rule.parent_label
+                or rule.pattern["child_label"] != edge_rule.child_label
+                or rule.pattern["count_semantics"] != "raw_matching_edges"
+                or rule.pattern["raw_count"] != edge_rule.count
+                or rule.pattern["parent_count"] != edge_rule.parent_count
+                or rule.pattern["child_count"] != edge_rule.child_count
+            ):
+                raise ConfigurationError(
+                    f"edge-BPE rule {expected_rank} generic pattern disagrees with "
+                    "its optimized rule record."
+                )
+            actual_events = rule.pattern["actual_events"]
+            if (
+                not isinstance(actual_events, int)
+                or isinstance(actual_events, bool)
+                or actual_events <= 0
+                or actual_events > edge_rule.count
+            ):
+                raise ConfigurationError(
+                    f"edge-BPE rule {expected_rank} has invalid actual event count "
+                    f"{actual_events!r}."
+                )
+            pair_score = rule.pattern["pair_score"]
+            if not isinstance(pair_score, str) or not pair_score:
+                raise ConfigurationError(
+                    f"edge-BPE rule {expected_rank} pair-score name must be nonempty."
+                )
+            if (
+                edge_rule.parent_count is None
+                or edge_rule.child_count is None
+                or edge_rule.parent_size is None
+                or edge_rule.child_size is None
+            ):
+                raise ConfigurationError(
+                    f"edge-BPE rule {expected_rank} is missing endpoint counts or fitting sizes."
+                )
+            expected_size = edge_rule.parent_size + edge_rule.child_size
+            if rule.output_fitting_size != expected_size:
+                raise ConfigurationError(
+                    f"edge-BPE rule {expected_rank} output fitting size disagrees with "
+                    "its endpoint sizes."
+                )
+            if rule.score != edge_rule.score:
+                raise ConfigurationError(
+                    f"edge-BPE rule {expected_rank} score disagrees with its optimized rule record."
+                )
+            available_labels.add(expected_token)
+        self.edge_rules = edge_rules
+        self.input_labels = input_labels
+
+    def transform(
+        self,
+        graph: nx.DiGraph,
+        *,
+        validate: str | bool = "full",
+    ) -> nx.DiGraph:
+        current = prepare_graph(graph, validate=validate)
+        input_is_normalized_raw = _has_raw_occurrence_geometry(current)
+        current_sizes = get_graph_fitting_sizes(current)
+        expected_sizes = dict(current_sizes)
+        for rule in self.edge_rules:
+            for label, expected in (
+                (rule.parent_label, rule.parent_size),
+                (rule.child_label, rule.child_size),
+            ):
+                actual = expected_sizes.get(label)
+                if actual is not None and actual != expected:
+                    raise FittingSizeError(
+                        f"edge-BPE rule {rule.rank} was fitted with label {label!r} "
+                        f"at size {expected}, but the transform graph records {actual}."
+                    )
+            assert rule.parent_size is not None and rule.child_size is not None
+            expected_sizes[rule.token] = rule.parent_size + rule.child_size
+
+        append_stage(current, model_id=self.model_id, vocab=self.vocab)
+        fit_vocab = _BPEVocabulary(get_graph_fitting_sizes(current))
 
         codec = _TokenCodec()
-        for label in sorted(self.vocab.symbols, key=repr):
+        for label in self.input_labels:
             codec.intern(label)
         for rule in self.edge_rules:
             codec.intern(rule.parent_label)
@@ -725,19 +861,12 @@ class EdgeBPEEncoder(TreeEncoder):
             codec.intern(rule.token)
 
         state = _CompactEdgeTree.from_graph(
-            G,
+            current,
             codec=codec,
-            vocab=self.vocab,
-            label_attr=self.label_attr,
-            type_attr=self.type_attr,
-            size_attr=self.size_attr,
-            time_attr=self.time_attr,
-            uid_attr=self.uid_attr,
-            super_label_attr=self.super_label_attr,
-            super_uid_attr=self.super_uid_attr,
-            attach_attr=self.attach_attr,
+            vocab=fit_vocab,
             model_id=self.model_id,
             capture_output=True,
+            input_is_normalized_raw=input_is_normalized_raw,
         )
         for rule in self.edge_rules:
             state.contract_pair(
@@ -750,7 +879,7 @@ class EdgeBPEEncoder(TreeEncoder):
 
 
 class EdgeBPECoarsener(TreeCoarsener):
-    """Learn ordinary BPE rules from parent/child fitting labels only."""
+    """Learn ordinary BPE rules from parent/child matching labels only."""
 
     def __init__(
         self,
@@ -759,29 +888,35 @@ class EdgeBPECoarsener(TreeCoarsener):
         min_pair_count: int = 2,
         pair_score: PairScore = "count",
         backend: Literal["python", "numba"] = "python",
-        **kwargs: Any,
+        model_id: str | None = None,
     ) -> None:
-        super().__init__(**kwargs)
-        if num_merges is not None and num_merges < 0:
-            raise ValueError("num_merges must be None or nonnegative.")
-        if min_pair_count < 1:
-            raise ValueError("min_pair_count must be at least 1.")
+        super().__init__(model_id=model_id)
+        if num_merges is not None and (
+            not isinstance(num_merges, int) or isinstance(num_merges, bool) or num_merges < 0
+        ):
+            raise ConfigurationError("num_merges must be None or a nonnegative integer.")
+        if (
+            not isinstance(min_pair_count, int)
+            or isinstance(min_pair_count, bool)
+            or min_pair_count < 1
+        ):
+            raise ConfigurationError("min_pair_count must be a positive integer.")
         if backend not in {"python", "numba"}:
-            raise ValueError("backend must be 'python' or 'numba'.")
+            raise ConfigurationError("backend must be 'python' or 'numba'.")
         if isinstance(pair_score, str):
             if pair_score not in _BUILTIN_PAIR_SCORES:
                 allowed = ", ".join(sorted(_BUILTIN_PAIR_SCORES))
-                raise ValueError(f"pair_score must be one of {allowed}, or a callable.")
+                raise ConfigurationError(f"pair_score must be one of {allowed}, or a callable.")
             pair_score_name: PairScoreName | None = pair_score
             pair_score_function = _BUILTIN_PAIR_SCORES[pair_score]
         elif callable(pair_score):
             pair_score_name = None
             pair_score_function = pair_score
         else:
-            raise TypeError("pair_score must be a built-in score name or a callable.")
+            raise ConfigurationError("pair_score must be a built-in score name or a callable.")
         if backend == "numba" and pair_score_name is None:
-            raise ValueError(
-                "backend='numba' supports the built-in pair_score values only; "
+            raise ConfigurationError(
+                "backend='numba' supports built-in pair_score values only; "
                 "use backend='python' for a custom callable."
             )
         self.num_merges = num_merges
@@ -802,49 +937,25 @@ class EdgeBPECoarsener(TreeCoarsener):
     def _fit(self, graphs: Sequence[nx.DiGraph]) -> tuple[TreeEncoder, TreeDecoder]:
         use_numba = self.backend == "numba"
         numba_forest: Any | None = None
+        backend_used: Literal["python", "numba"] = "python"
         if use_numba:
             from .edge_bpe_numba import NumbaTrainingForest, require_numba
 
             require_numba()
-            self.backend_used_ = "numba"
-        else:
-            self.backend_used_ = "python"
-        input_alphabet = infer_input_alphabet(
-            graphs,
-            label_attr=self.label_attr,
-            type_attr=self.type_attr,
-            size_attr=self.size_attr,
-            attach_attr=self.attach_attr,
-        )
-        vocab = Vocabulary(symbols=input_alphabet)
+            backend_used = "numba"
+
+        fitting_sizes = fit_corpus_fitting_sizes(graphs)
+        input_labels = tuple(sorted(fitting_sizes, key=repr))
+        vocab = _BPEVocabulary(dict(fitting_sizes))
         codec = _TokenCodec()
         counts: Counter[EdgeKey] = Counter()
         states: list[_CompactEdgeTree] = []
-
         for graph in graphs:
-            if self.validate_inputs:
-                validate_coarsenable_tree(
-                    graph,
-                    label_attr=self.label_attr,
-                    type_attr=self.type_attr,
-                    size_attr=self.size_attr,
-                    time_attr=self.time_attr,
-                    super_label_attr=self.super_label_attr,
-                    super_uid_attr=self.super_uid_attr,
-                )
             states.append(
                 _CompactEdgeTree.from_graph(
                     graph,
                     codec=codec,
                     vocab=vocab,
-                    label_attr=self.label_attr,
-                    type_attr=self.type_attr,
-                    size_attr=self.size_attr,
-                    time_attr=self.time_attr,
-                    uid_attr=self.uid_attr,
-                    super_label_attr=self.super_label_attr,
-                    super_uid_attr=self.super_uid_attr,
-                    attach_attr=self.attach_attr,
                     pair_counts=None if use_numba else counts,
                     capture_output=False,
                     build_edge_index=not use_numba,
@@ -855,12 +966,15 @@ class EdgeBPECoarsener(TreeCoarsener):
             max_possible_merges = sum(len(state.parent) - 1 for state in states)
             if self.num_merges is not None:
                 max_possible_merges = min(max_possible_merges, self.num_merges)
+            initial_label_sizes = [
+                vocab.fitting_size(codec.decode(label_id))
+                for label_id in range(len(codec.id_to_token))
+            ]
             numba_forest = NumbaTrainingForest.from_compact_states(
                 states,
                 label_capacity=len(codec.id_to_token) + max_possible_merges,
+                initial_label_sizes=initial_label_sizes,
             )
-            # The compiled forest now owns independent NumPy arrays.  Release
-            # the temporary Python list-of-lists states before the merge loop.
             states.clear()
             label_counts: list[int] | None = None
             label_sizes: list[int] | None = None
@@ -869,20 +983,15 @@ class EdgeBPECoarsener(TreeCoarsener):
 
         learned: list[EdgeBPERule] = []
         encoding_rules: list[EncodingRule] = []
-        self.history_ = []
+        history: list[dict[str, Any]] = []
         rank = 0
         while self.num_merges is None or rank < self.num_merges:
             if numba_forest is None:
-                if label_counts is None or label_sizes is None:  # pragma: no cover
+                if label_counts is None or label_sizes is None:
                     raise RuntimeError("Python BPE fitting is missing label statistics.")
-                best = self._select_best_pair(
-                    counts,
-                    codec,
-                    label_counts,
-                    label_sizes,
-                )
+                best = self._select_best_pair(counts, codec, label_counts, label_sizes)
             else:
-                if self.pair_score_name_ is None:  # guarded in __init__
+                if self.pair_score_name_ is None:
                     raise RuntimeError("custom pair scorer reached Numba selection.")
                 best = numba_forest.select_best_pair(
                     self.min_pair_count,
@@ -896,20 +1005,12 @@ class EdgeBPECoarsener(TreeCoarsener):
             parent_id, child_id = key
             parent_label = codec.decode(parent_id)
             child_label = codec.decode(child_id)
-            token = edge_bpe_token(rank)
+            token = edge_bpe_token(self.model_id, rank)
 
-            parent_spec = vocab.symbols[parent_label]
-            child_spec = vocab.symbols[child_label]
-            vocab.add_symbol(
-                token,
-                TokenSpec(
-                    site_count=parent_spec.site_count + child_spec.site_count,
-                    root_count=parent_spec.root_count,
-                ),
-            )
+            vocab.add_fitting_size(token, best.parent_size + best.child_size)
             new_id = codec.intern(token)
             if numba_forest is None:
-                if label_counts is None or label_sizes is None:  # pragma: no cover
+                if label_counts is None or label_sizes is None:
                     raise RuntimeError("Python BPE fitting is missing label statistics.")
                 _set_new_label_statistics(
                     label_counts,
@@ -929,13 +1030,10 @@ class EdgeBPECoarsener(TreeCoarsener):
                     events=actual_events,
                 )
             else:
-                numba_forest.register_label(
-                    new_id,
-                    size=best.parent_size + best.child_size,
-                )
+                numba_forest.register_label(new_id, size=best.parent_size + best.child_size)
                 actual_events = numba_forest.contract_pair(key, new_label=new_id)
             if actual_events == 0:
-                vocab.symbols.pop(token, None)
+                vocab.fitting_sizes.pop(token, None)
                 if numba_forest is None:
                     counts.pop(key, None)
                     continue
@@ -944,48 +1042,45 @@ class EdgeBPECoarsener(TreeCoarsener):
                     "contractible occurrence."
                 )
 
-            rule = EdgeBPERule(
-                rank=rank,
-                token=token,
-                parent_label=parent_label,
-                child_label=child_label,
-                count=raw_count,
-                score=best.score,
-                parent_count=best.parent_count,
-                child_count=best.child_count,
-                parent_size=best.parent_size,
-                child_size=best.child_size,
+            learned.append(
+                EdgeBPERule(
+                    rank=rank,
+                    token=token,
+                    parent_label=parent_label,
+                    child_label=child_label,
+                    count=raw_count,
+                    score=best.score,
+                    parent_count=best.parent_count,
+                    child_count=best.child_count,
+                    parent_size=best.parent_size,
+                    child_size=best.child_size,
+                )
             )
-            learned.append(rule)
             encoding_rules.append(
                 EncodingRule(
-                    token=token,
+                    rule_index=rank,
                     operation="edge",
-                    created_at_step=rank,
+                    output_label=token,
+                    output_fitting_size=best.parent_size + best.child_size,
                     pattern={
                         "parent_label": parent_label,
                         "child_label": child_label,
-                    },
-                    score=best.score,
-                    metadata={
-                        "actual_events": actual_events,
                         "count_semantics": "raw_matching_edges",
-                        "pair_score": self.pair_score_display_name_,
                         "raw_count": raw_count,
+                        "actual_events": actual_events,
+                        "pair_score": self.pair_score_display_name_,
                         "parent_count": best.parent_count,
                         "child_count": best.child_count,
-                        "parent_size": best.parent_size,
-                        "child_size": best.child_size,
                     },
+                    score=best.score,
                 )
             )
-            self.history_.append(
+            history.append(
                 {
                     "rank": rank,
                     "token": token,
                     "parent_label": parent_label,
                     "child_label": child_label,
-                    # Compatibility aliases.
                     "parent_token": parent_label,
                     "child_token": child_label,
                     "count": raw_count,
@@ -1001,36 +1096,16 @@ class EdgeBPECoarsener(TreeCoarsener):
             )
             rank += 1
 
-        output_raw = all(graph.graph.get(RAW_INPUT_FLAG, False) for graph in graphs)
+        rules = tuple(encoding_rules)
         encoder = EdgeBPEEncoder(
             model_id=self.model_id,
-            vocab=vocab,
-            rules=tuple(encoding_rules),
-            base_labels=frozenset(input_alphabet),
-            label_attr=self.label_attr,
-            type_attr=self.type_attr,
-            size_attr=self.size_attr,
-            time_attr=self.time_attr,
-            uid_attr=self.uid_attr,
-            super_label_attr=self.super_label_attr,
-            super_uid_attr=self.super_uid_attr,
-            attach_attr=self.attach_attr,
+            rules=rules,
             edge_rules=tuple(learned),
+            input_labels=input_labels,
         )
-        decoder = StructuralStageDecoder(
-            model_id=self.model_id,
-            vocab=vocab,
-            base_labels=frozenset(input_alphabet),
-            label_attr=self.label_attr,
-            type_attr=self.type_attr,
-            size_attr=self.size_attr,
-            time_attr=self.time_attr,
-            uid_attr=self.uid_attr,
-            super_label_attr=self.super_label_attr,
-            super_uid_attr=self.super_uid_attr,
-            attach_attr=self.attach_attr,
-            output_raw=output_raw,
-        )
+        decoder = StructuralStageDecoder(model_id=self.model_id, rules=rules)
+        self.backend_used_ = backend_used
+        self.history_ = history
         return encoder, decoder
 
     def _select_best_pair(

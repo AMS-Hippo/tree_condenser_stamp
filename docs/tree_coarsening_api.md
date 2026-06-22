@@ -1,509 +1,871 @@
-# Tree Coarsening API Contract
+# Tree Coarsening Normative API — Schema 1.0
 
-## 1. Scope
+**Specification status:** current handoff contract  
+**Encoded graph schema version:** `1.0`  
+**Compatibility policy:** implementations of schema `1.0` are not required to read earlier encoded schemas.
 
-A **tree coarsener** replaces a larger labeled directed tree by a smaller labeled directed tree. The design is BPE-like: fitting learns ordered contractions and a vocabulary of learned supertokens; transforming applies those contractions to new trees; decoding expands supertokens back into finer tree structure.
+This document is the implementation target for the next stable `tree_coarsening` package. It supersedes earlier contracts based on finite static `(P, L, A)` vocabularies, nested `super_label`, fixed geometry per matching label, or scalar `attach_index`.
 
-The public data object is always a NetworkX `DiGraph`. Encoders, decoders, vocabularies, provenance tables, and rule metadata are auxiliary artifacts produced and consumed by the package.
+## 1. Normative language
 
-The two primitive learned contractions are:
+The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are normative.
 
-1. **Edge contraction**: contract one encoded parent occurrence together with one encoded child occurrence.
-2. **Sibling contraction**: contract several encoded vertices that have the same encoded parent occurrence.
+- **MUST / MUST NOT**: required for interoperability or correctness.
+- **SHOULD / SHOULD NOT**: strong recommendation; deviations require a documented reason.
+- **MAY**: permitted but optional.
 
-A direct **component contraction** may also materialize an explicitly selected connected raw subtree as one vocabulary recipe. It is a convenience operation equivalent in expressive power to a deterministic sequence of edge contractions; it is used by `NamedVertexCoarsener` and is not statistically learned.
+## 2. Scope
 
-For sibling contraction, “sibling” means sibling in the current encoded tree. Two vertices may share an encoded parent while attaching to different internal sites of that parent after full expansion. This is allowed because encoded edges carry tuple-valued gluing metadata.
+A tree coarsener replaces a larger labeled directed rooted tree with a smaller labeled directed rooted tree by applying an ordered contraction program.
 
----
+The public graph object is always `networkx.DiGraph`. Auxiliary fitted artifacts include encoders, decoders, matching vocabularies, rule records, exact structural types, stage lineage, and raw provenance.
 
-## 2. Raw input graphs
+Schema `1.0` supports:
 
-`fit` receives a sequence of directed rooted trees:
+- directed edge contraction;
+- sibling contraction in the **current encoded tree**;
+- contraction of connected current-tree components;
+- parametric rule families whose occurrences have different exact geometry;
+- exact full-stage reversal;
+- stage-local partial decoding;
+- lazy composition of fitted stages.
+
+Schema `1.0` does not require:
+
+- backward compatibility with earlier graph schemas;
+- a stable fitted-artifact disk format;
+- pickle compatibility;
+- preservation of arbitrary raw edge attributes;
+- materialized composition;
+- targeted decoding through a combined multi-stage decoder;
+- optimized support for adversarially deep exact-type nesting.
+
+## 3. Central occurrence model
+
+Every encoded node occurrence has these package fields:
 
 ```python
-Sequence[nx.DiGraph]
+node["label"]       # matching identity
+node["type"]        # exact occurrence-specific structure
+node["size"]        # exact fully expanded site count
+node["time"]        # representative time
+node["super_uids"]  # original UIDs in exact site order
 ```
 
-Each graph must satisfy:
+Every encoded edge has:
 
+```python
+edge["attach_map"]  # exposed child roots -> sites of the parent occurrence
+```
+
+The core invariants are:
+
+1. Matching and statistical fitting use `label`.
+2. Structural transformation and decoding use `type`, `size`, `super_uids`, and `attach_map`.
+3. Equal labels MAY have unequal exact types, exact sizes, root counts, arities, and attachment maps.
+4. A downstream coarsener MUST NOT parse another producer's label to infer hidden geometry or wildcard positions.
+5. Every concrete graph carries the exact information needed to transform it without consulting an upstream decoder.
+
+For example, all stars in one family may use:
+
+```python
+("star", "P", "S")
+```
+
+while one occurrence represents 12 immediate components and another represents 37.
+
+## 4. Raw graph schema
+
+A raw input MUST be a nonempty, non-multigraph `nx.DiGraph` satisfying:
+
+- exactly one node has in-degree zero;
+- every other node has in-degree one;
+- all edges point from parent to child;
+- the graph is acyclic;
 - the underlying undirected graph is connected;
-- `|E| = |V| - 1`;
-- exactly one vertex has in-degree `0`;
-- every non-root vertex has in-degree `1`;
-- all edges are directed from parent to child.
+- `|E| = |V| - 1`.
 
-Every raw node must have:
+Every raw node MUST contain:
 
 ```python
-G.nodes[v]["label"]  # str
-G.nodes[v]["time"]   # int | float
+node["label"]  # str
+node["time"]   # finite real, excluding bool
+node["uid"]    # stable hashable UID, unique within this raw graph
 ```
 
-For exact provenance, every raw node should also have:
+A UID SHOULD be a stable primitive or recursively tuple-valued object. If a custom hashable object is used, its equality, hash, and representation MUST remain stable during package operations.
+
+Raw nodes MAY contain arbitrary additional user attributes. Raw graph attributes MAY also be arbitrary except that names beginning with `tree_coarsening_` are reserved.
+
+Raw node fields `type`, `size`, and `super_uids` are reserved and MUST NOT be supplied as user data.
+
+Raw edge attributes are outside the round-trip guarantee. A decoder reconstructs raw parent-child UID edges; original edge attributes can be joined back from an externally retained original graph.
+
+## 5. Raw normalization
+
+Before transformation, every raw node is normalized privately as:
 
 ```python
-G.nodes[v]["uid"]
+label       = raw_node["label"]
+type        = ("base", raw_node["label"])
+size        = 1
+time        = float(raw_node["time"])
+super_uids  = (raw_node["uid"],)
 ```
 
-If `uid` is missing, the encoder may use the NetworkX node key as the UID, but this fallback must be explicit and validated.
-
----
-
-## 3. Encoded graph schema
-
-An encoded graph is also a directed rooted tree. Its nodes represent occurrences of vocabulary tokens.
-
-Encoded node keys are opaque NetworkX identifiers. Implementations should usually relabel encoded nodes to simple consecutive integers after transform. The node key is not the token label and is not provenance.
-
-Encoded nodes have exactly the following required attributes:
+Every raw edge becomes:
 
 ```python
-H.nodes[z]["label"]       # token id, e.g. ("base", "P") or ("star", "P", "S", 4)
-H.nodes[z]["super_uids"]  # flat tuple of original UIDs in canonical site order
+attach_map = (0,)
 ```
 
-Encoded nodes should not need separate `type`, `uid`, `raw_label`, `time`, `time_span`, or `super_time` attributes. If those quantities are needed, they should be derived from:
-
-1. the token stored in `label`;
-2. the occurrence-level `super_uids`; and
-3. the graph-level provenance table described below.
-
-Encoded edges carry tuple-valued gluing data:
+The initial encoded metadata is:
 
 ```python
-H.edges[u, v]["attach_map"] = tuple[int, ...]
+schema = {"version": "1.0", "stages": ()}
+fitting_sizes[raw_label] = 1
+provenance = snapshot of raw node attributes and nonreserved graph attributes
 ```
 
-For an encoded edge `u -> v`, if the child token is `T_v`, then:
+Different coarseners MUST use the same base normalization.
+
+## 6. Encoded graph schema
+
+An encoded graph is also a directed rooted tree. Package-produced encoded nodes contain exactly:
 
 ```python
-len(H.edges[u, v]["attach_map"]) == root_count(T_v)
+label
+type
+size
+time
+super_uids
 ```
 
-The `k`-th entry says which expanded site of the parent token receives the `k`-th exposed root of the child token.
-
-A scalar `attach_index` may be accepted at user boundaries as shorthand for the one-root case, but the internal schema should normalize to tuple-valued `attach_map`.
-
----
-
-## 4. Token ids
-
-A **token id** is any hashable object, but tuple tokens are recommended because they are explicit and easy to inspect.
-
-Base tokens use:
+Package-produced encoded edges contain exactly:
 
 ```python
-("base", raw_label)
+attach_map
 ```
 
-For example:
-
-```python
-("base", "P")
-```
-
-`EdgeBPECoarsener` uses:
-
-```python
-("edge_bpe", rank)
-```
-
-where `rank` is the zero-based order in which the edge merge was learned. The expanded structure is recorded in the vocabulary entry, not repeated in the token id.
-
-`StarCoarsener` uses:
-
-```python
-("star", parent_label, child_label, arity)
-```
-
-For example:
-
-```python
-("star", "P", "S", 4)
-```
-
-means that four children with raw label `"S"` were contracted under an encoded parent whose raw label was `"P"` when the rule was learned/applied.
-
-For `EdgeBPECoarsener(num_merges=None, min_pair_count=2)`, fitting repeatedly selects the most frequent encoded edge `(parent_token, child_token, attach_map)` with count at least `min_pair_count` and creates one staged edge token. The score is the raw number of matching live edges, including overlapping occurrences. The rule application then contracts a deterministic vertex-disjoint subset of those occurrences. `history_[i]["count"]` stores the raw score and `history_[i]["actual_events"]` stores the number contracted. `num_merges` caps the number of learned rules; `None` means continue until no eligible edge remains.
-
-Because this coarsener uses edge contractions only, every token it creates has exactly one exposed root. Its private compact representation therefore stores an incoming attachment as one integer site. Vocabulary entries and encoded NetworkX edges still use the general tuple-valued `A` and `attach_map` schema.
-
-For `StarCoarsener(d, m, contract_d=None)`, `d` is the witness threshold and `m` is the minimum number of witnesses needed to learn a pair. After a pair is learned, `contract_d` is the transform-time threshold; it defaults to `d` and must satisfy `2 <= contract_d <= d`. The fitted vocabulary is closed after `fit`, so only arities observed during fitting for learned pairs are contracted during transform.
-
-`NamedVertexCoarsener` selects raw vertices either by UID or by raw string label:
-
-```python
-NamedVertexCoarsener(uids={"u17", "u18"}, component_policy="all")
-NamedVertexCoarsener(labels={"A", "B"}, component_policy="largest")
-```
-
-The selected vertices induce maximal connected components in the raw tree. `component_policy="all"` contracts every component of size at least two; `"largest"` contracts one largest component, with deterministic tie-breaking. Singletons are left as base tokens. `fit` learns no statistics and creates an empty shared encoder/decoder vocabulary. During `transform`, each previously unseen canonical component recipe is registered lazily under a compact token of the form:
-
-```python
-("named_component", selector_kind, component_size, digest)
-```
-
-The digest is only a compact token identifier; the complete `(P, L, A)` recipe remains authoritative in the vocabulary. Because registration occurs during `transform`, the encoder and decoder share the same mutable `Vocabulary` object.
-
----
-
-## 5. Vocabulary entries: staged canonical recipes
-
-The authoritative vocabulary representation is a staged recipe:
-
-```python
-P: tuple[int, ...]
-L: tuple[token_id, ...]
-A: tuple[int, ...]
-```
-
-`P` and `L` are position-aligned. `A` is a flat homogeneous vector of integer attachment sites.
-
-Let `n = len(P) = len(L)`. Each index `i` is a recipe position.
-
-- `L[i]` is a component token id.
-- `P[i] = j >= 0` means recipe position `j` is the parent component of recipe position `i`.
-- `P[i] = -1` means recipe position `i` is externally attached to the parent of the whole token occurrence.
-- `A` stores internal attachment maps for all positions with `P[i] >= 0`, in recipe order.
-
-For a position `i` with `P[i] >= 0`, its attachment slice is:
-
-```python
-def attachment_slice(entry, i):
-    start = sum(root_count(entry.L[h]) for h in range(i) if entry.P[h] >= 0)
-    stop = start + root_count(entry.L[i])
-    return entry.A[start:stop]
-```
-
-For a position with `P[i] == -1`, there is no internal attachment slice.
-
-For a learned token `T = (P, L, A)`:
-
-```python
-site_count(T) = sum(site_count(L[i]) for i in range(len(L)))
-root_count(T) = sum(root_count(L[i]) for i in range(len(L)) if P[i] == -1)
-```
-
-The expanded site order is deterministic: concatenate the expanded site orders of recipe positions in recipe order. The expanded root order is deterministic: concatenate expanded roots of recipe positions with `P[i] == -1`, again in recipe order.
-
-### Why `A` is part of the vocabulary
-
-Staged recipes must distinguish tokens that have the same component structure but different internal gluing.
-
-Suppose `T_AB` represents:
+The following are not schema-`1.0` encoded-node fields:
 
 ```text
-A
-└── B
+uid
+raw_label
+super_label
+super_time
+time_span
 ```
 
-with:
+Scalar `attach_index` is not part of schema `1.0`.
+
+Consumer-added attributes MAY be accepted, but package methods do not depend on them and need not preserve them.
+
+For every encoded node `z`:
 
 ```python
-P = (-1, 0)
-L = (("base", "A"), ("base", "B"))
-A = (0,)
+z.label == exact_type_label(z.type)
+z.size == exact_site_count(z.type)
+z.size == len(z.super_uids)
 ```
 
-A later edge token using `T_AB` and `C` can attach `C` to site `0` of `T_AB`:
+For every encoded edge `u -> v`:
 
 ```python
-P = (-1, 0)
-L = (T_AB, ("base", "C"))
-A = (0,)
+len(attach_map) == exact_root_count(v.type)
+all(0 <= q < u.size for q in attach_map)
 ```
 
-which represents:
-
-```text
-A
-├── B
-└── C
-```
-
-or it can attach `C` to site `1` of `T_AB`:
+The encoded root MUST satisfy:
 
 ```python
-P = (-1, 0)
-L = (T_AB, ("base", "C"))
-A = (1,)
+exact_root_count(root.type) == 1
 ```
 
-which represents:
+Package-produced encoded node keys SHOULD be consecutive integers in deterministic parent-before-child order. Correctness MUST NOT depend on those keys.
 
-```text
-A
-└── B
-    └── C
-```
+## 7. Graph metadata and lineage
 
-These are different vocabulary entries because they decode to different trees.
-
----
-
-## 6. Provenance and reconstruction
-
-`super_uids` records which original vertices are represented by a token occurrence. It is flat, not nested:
+Encoded graphs contain these reserved graph attributes:
 
 ```python
-len(H.nodes[z]["super_uids"]) == site_count(H.nodes[z]["label"])
+graph["tree_coarsening_schema"]
+graph["tree_coarsening_fitting_sizes"]
+graph["tree_coarsening_provenance"]
 ```
 
-The order must agree with the token’s canonical expanded site order.
-
-For a base token occurrence:
+The schema record is:
 
 ```python
-H.nodes[z]["label"] = ("base", "P")
-H.nodes[z]["super_uids"] = ("g0_n7",)
-```
-
-For a star token occurrence:
-
-```python
-H.nodes[z]["label"] = ("star", "P", "S", 4)
-H.nodes[z]["super_uids"] = ("g0_s10", "g0_s11", "g0_s12", "g0_s13")
-```
-
-Exact reconstruction of raw attributes uses a graph-level provenance table:
-
-```python
-H.graph["tree_coarsening_provenance"] = {
-    "uid_attr": "uid",
-    "node_attrs_by_uid": {
-        uid: original_node_attribute_dict,
-        ...,
-    },
+{
+    "version": "1.0",
+    "stages": (
+        {
+            "model_id": str,
+            "introduced_labels": tuple[MatchingLabel, ...],
+        },
+        ...
+    ),
 }
 ```
 
-This keeps encoded node attributes small. Times, raw labels, original node attributes, and original UIDs are derived from `super_uids` and the provenance table.
+Stage records are ordered from earliest to latest active stage. Model IDs MUST be unique within one lineage.
 
----
+A complete stage decode may run only when its decoder owns the latest active stage.
 
-## 7. Constructing new staged vocabulary entries
+When a stage is fully reversed, its record and only the fitting-size labels it introduced are removed. Earlier stage records and inherited fitting sizes remain unchanged.
 
-### Edge contraction
+A no-op transform still appends one stage record, so encoder/decoder temporal order remains explicit.
 
-Suppose the encoded graph contains an edge:
+## 8. Matching labels and fitting sizes
+
+A matching label is an immutable, hashable identity compared by ordinary equality. Package-generated labels SHOULD use stable strings, non-Boolean integers, and recursively tuple-valued labels.
+
+Exact node `size` and label-level fitting size are different concepts:
+
+```python
+node["size"]                 # exact represented original-site count
+fitting_sizes[node["label"]] # statistical size of this matching label
+```
+
+All occurrences with one label MUST share one fitting size even when exact sizes differ.
+
+An encoded fitting-size mapping MUST cover:
+
+- every raw base label in provenance;
+- every label introduced by an active stage;
+- every label reachable in visible or nested exact types.
+
+A fit corpus MUST reject conflicting fitting sizes for the same label.
+
+## 9. Stage vocabulary
+
+A fitted stage's vocabulary is the finite read-only mapping:
+
+```python
+output_matching_label -> positive fitting size
+```
+
+It is derived from the stage's fitted rules. It does not contain exact types, fixed geometry, or decoder recipes.
+
+Suggested API:
+
+```python
+vocab.labels
+vocab.has_label(label)
+vocab.fitting_size(label)
+vocab.as_dict()
+```
+
+There is no public fixed-geometry registry and no static recipe vocabulary in schema `1.0`.
+
+## 10. Exact structural types
+
+```python
+ExactType = BaseType | CompositeType
+```
+
+### 10.1 Base type
+
+A raw label `A` has base exact type:
+
+```python
+("base", A)
+```
+
+For a base type:
+
+```python
+exact_type_label(T) == A
+exact_site_count(T) == 1
+exact_root_count(T) == 1
+```
+
+### 10.2 Composite type
+
+Normative semantic form:
+
+```python
+@dataclass(frozen=True)
+class CompositeType:
+    model_id: str
+    label: MatchingLabel
+    parent: tuple[int, ...]
+    components: tuple[ExactType, ...]
+    attach: tuple[int, ...]
+```
+
+Let `n = len(parent) = len(components)`. Requirements:
+
+- `n >= 1`;
+- `model_id` is nonempty;
+- every `parent[i]` belongs to `{-1, 0, ..., n-1}`;
+- `parent[i] != i`;
+- component-parent relations are acyclic;
+- package-produced composites place parents before children;
+- every component is a valid exact type;
+- nested stage ownership never points to a later stage than its container.
+
+`parent[i] == -1` means component `i` is an exposed root component.
+
+`attach` is a flat vector. For every component with an internal parent, its slice has width `exact_root_count(components[i])`. Slices are concatenated in component order, skipping exposed-root components.
+
+If `parent[i] == j`, each value in component `i`'s slice is a valid site of `components[j]`.
+
+Derived geometry:
+
+```python
+exact_site_count(T) = sum(exact_site_count(C) for C in T.components)
+
+exact_root_count(T) = sum(
+    exact_root_count(T.components[i])
+    for i, p in enumerate(T.parent)
+    if p == -1
+)
+```
+
+Composite site order is concatenation of component site orders. Composite exposed-root order is concatenation of exposed roots of root components.
+
+Two equal labels do not imply equal composite types.
+
+## 11. Attachment semantics
+
+For an encoded edge:
 
 ```text
 u -> v
 ```
 
-with:
+`attach_map[k]` is the site of `u` to which exposed root `k` of `v` attaches.
+
+A multi-root child still has one current encoded parent node. Duplicate parent-site values are valid.
+
+Broad sibling contraction is therefore exact. Siblings need only share the same current encoded parent; their incoming attachment maps need not be equal.
+
+## 12. Provenance
+
+Graph-level provenance contains:
 
 ```python
-M = H.edges[u, v]["attach_map"]
-T_u = H.nodes[u]["label"]
-T_v = H.nodes[v]["label"]
+{
+    "node_attrs_by_uid": Mapping[UID, Mapping[str, Any]],
+    "graph_attrs": Mapping[Any, Any],
+}
 ```
 
-The staged recipe for the new edge token is:
+Every raw node's complete attribute mapping is stored by UID. `graph_attrs` stores original nonreserved graph attributes.
+
+Across current encoded nodes, `super_uids` MUST form an exact one-time partition of provenance UIDs.
+
+`super_uids` follows exact site order. Nested provenance is derived by splitting the flat UID tuple using component exact site counts. A separate nested `super_label` is redundant and not part of schema `1.0`.
+
+Representative encoded time is:
 
 ```python
-P = (-1, 0)
-L = (T_u, T_v)
-A = M
+max(provenance[uid]["time"] for uid in super_uids)
 ```
 
-This naturally creates different vocabulary entries when the same child token attaches to different internal sites of the same parent token.
+A complete decode MUST NOT invent missing labels, UIDs, times, or raw attributes, including under `validate=False`.
 
-### Sibling contraction
+## 13. Generic contraction
 
-Suppose `v_1, ..., v_r` are contracted as siblings under the same encoded parent `u`. Let:
+A contraction selects a nonempty current-node forest and orders its nodes deterministically.
 
-```python
-T_i = H.nodes[v_i]["label"]
-M_i = H.edges[u, v_i]["attach_map"]
-```
-
-The staged recipe for the new sibling token is:
+Let selected nodes be `v_0, ..., v_{n-1}`. The new exact type is:
 
 ```python
-P = (-1, -1, ..., -1)
-L = (T_1, T_2, ..., T_r)
-A = ()
-```
-
-The replacement edge from `u` to the new token stores the concatenated attachment maps:
-
-```python
-attach_map = M_1 + M_2 + ... + M_r
-```
-
-This construction only requires the selected vertices to share the same encoded parent. It does not require their incoming `attach_map`s to be equal.
-
----
-
-## 8. Encoder, decoder, and coarsener API
-
-### Vocabulary dataclass
-
-```python
-@dataclass(frozen=True)
-class VocabEntry:
-    token: Hashable
-    parent: tuple[int, ...]
-    label: tuple[Hashable, ...]
-    attach: tuple[int, ...]
-    created_at_step: int
-    operation: Literal["base", "edge", "siblings", "component"]
-    score: float | None = None
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-```
-
-### Encoder
-
-```python
-class TreeEncoder:
-    model_id: str
-    vocab: Vocabulary
-    rules: Sequence[EncodingRule]
-    base_labels: set[str]
-
-    label_attr: str = "label"
-    time_attr: str = "time"
-    uid_attr: str = "uid"
-    super_uid_attr: str = "super_uids"
-    attach_attr: str = "attach_map"
-
-    def encode(self, G: nx.DiGraph, *, validate: bool = True) -> nx.DiGraph: ...
-```
-
-Encoding initializes raw vertices as base tokens, initializes raw edges with `attach_map=(0,)`, and then applies learned rules in temporal order.
-
-### Decoder
-
-```python
-class TreeDecoder:
-    model_id: str
-    vocab: Vocabulary
-    base_labels: set[str]
-
-    label_attr: str = "label"
-    time_attr: str = "time"
-    uid_attr: str = "uid"
-    super_uid_attr: str = "super_uids"
-    attach_attr: str = "attach_map"
-
-    def decode(
-        self,
-        H: nx.DiGraph,
-        *,
-        target: Any | None = None,
-        by: Literal["node", "label"] = "node",
-        recursive: bool = True,
-        boundary_policy: Literal["expand", "raise"] = "expand",
-        validate: bool = True,
-    ) -> nx.DiGraph: ...
-```
-
-Recommended behavior:
-
-- `target is None`: decode the whole graph;
-- `by="node"`: decode one encoded node occurrence;
-- `by="label"`: decode every occurrence with the given token label;
-- `recursive=False`: expand one recipe layer where possible;
-- `recursive=True`: continue expanding selected tokens until base labels are reached.
-
-### Abstract coarsener
-
-```python
-class TreeCoarsener(ABC):
-    encoder_: TreeEncoder | None = None
-    decoder_: TreeDecoder | None = None
-
-    def fit(self, graphs: Sequence[nx.DiGraph]) -> Self: ...
-    def transform(self, graph: nx.DiGraph) -> nx.DiGraph: ...
-    def inverse_transform(self, graph: nx.DiGraph, **decode_kwargs) -> nx.DiGraph: ...
-```
-
-This supports:
-
-```python
-H = coarsener.fit(X).transform(Y)
-encoder = coarsener.encoder_
-decoder = coarsener.decoder_
-```
-
----
-
-## 9. Partial decoding and boundary policy
-
-Full recursive decoding is always unambiguous.
-
-Partial decoding can expose a boundary problem. If expanding a parent token would require one still-collapsed child token to have multiple encoded parents, the result would not be a directed tree. Therefore:
-
-- `boundary_policy="expand"` minimally expands the boundary child enough to preserve a tree;
-- `boundary_policy="raise"` raises a validation error.
-
-This is the cost of allowing broad sibling contractions under a supernode parent. They are valid and exactly decodable, but some partial decodes need boundary-aware expansion.
-
----
-
-## 10. Composition
-
-Sequentially fitted encoders should compose lazily first:
-
-```python
-def combine(
-    encoders: Sequence[TreeEncoder],
-    decoders: Sequence[TreeDecoder],
-    *,
-    mode: Literal["lazy", "materialized"] = "lazy",
-    validate: bool = True,
-) -> tuple[TreeEncoder, TreeDecoder]: ...
-```
-
-The encoders and decoders are supplied in encoder application order:
-
-```python
-combined_encoder, combined_decoder = combine(
-    encoders=[encoder1, encoder2, encoder3],
-    decoders=[decoder1, decoder2, decoder3],
+CompositeType(
+    model_id=encoder.model_id,
+    label=rule.output_label,
+    parent=selected_parent_vector,
+    components=tuple(G.nodes[v_i]["type"] for i in range(n)),
+    attach=concatenated_internal_attachment_maps,
 )
 ```
 
-Then:
+The replacement node has:
 
 ```python
-combined_encoder.encode(G)
+label       = rule.output_label
+type        = composite above
+size        = sum(component sizes)
+super_uids  = concatenation of component super_uids
+time        = max(component times)
 ```
 
-means:
+A selected forest is contractible when either:
+
+- it contains the graph root and has exactly one selected root; or
+- all selected roots share one unselected current parent.
+
+Incoming maps for selected roots are concatenated in selected-root order.
+
+Outgoing edges from selected component `i` are offset by:
 
 ```python
-encoder3.encode(encoder2.encode(encoder1.encode(G)))
+offset_i = sum(component_size[h] for h in range(i))
 ```
 
-and:
+so an old map `M` becomes:
 
 ```python
-combined_decoder.decode(H)
+tuple(offset_i + q for q in M)
 ```
 
-means:
+Simultaneous contractions MUST be vertex-disjoint and deterministic.
+
+## 14. Primitive contractions
+
+### 14.1 Edge contraction
+
+For current edge `u -> v` with map `M`:
 
 ```python
-decoder1.decode(decoder2.decode(decoder3.decode(H)))
+parent     = (-1, 0)
+components = (type(u), type(v))
+attach     = M
 ```
 
-Materialized composition is useful but requires careful root/site coordinate translation and should come after the lazy version has tests.
+Outgoing sites from `v` shift by `size(u)`.
 
----
+### 14.2 Sibling contraction
 
-## 11. Locked design decisions
+For selected current siblings `v_1, ..., v_r`:
 
-1. Vocabulary entries are staged recipes `(P, L, A)`.
-2. `A` is a flat integer attachment vector.
-3. Encoded node `label` is the token id; there is no separate required `type` field.
-4. Encoded node keys are opaque and should usually be simple consecutive integers.
-5. Encoded nodes store flat `super_uids`, not nested `super_label`.
-6. Raw node attributes, including time, are recovered from graph-level provenance.
-7. Encoded edges use tuple-valued `attach_map`.
-8. Sibling means sibling in the encoded tree.
-9. Broad sibling contractions are valid and exactly decodable.
-10. Partial decoding is boundary-aware.
-11. Composition should start lazy.
+```python
+parent     = (-1,) * r
+components = tuple(type(v_i) for i in range(r))
+attach     = ()
+```
+
+The replacement incoming edge concatenates their old incoming maps.
+
+## 15. Encoding rules
+
+Normative semantic form:
+
+```python
+@dataclass(frozen=True)
+class EncodingRule:
+    rule_index: int
+    operation: str
+    output_label: MatchingLabel
+    output_fitting_size: int
+    pattern: Mapping[str, Any]
+    parameter_names: tuple[str, ...] = ()
+    score: float | None = None
+```
+
+Requirements:
+
+- rule indices are consecutive and define temporal order;
+- `operation` is nonempty;
+- output label is immutable and hashable;
+- output fitting size is a positive non-Boolean integer;
+- pattern is immutable from the caller's perspective;
+- parameter names identify occurrence-specific data omitted from the matching label;
+- generic rewiring and decoding do not branch on `operation` or parameter names.
+
+The vocabulary MUST equal the distinct ordered rule-output labels and their declared fitting sizes.
+
+## 16. Encoder artifact
+
+A fitted encoder exposes:
+
+```python
+encoder.model_id
+encoder.rules
+encoder.vocab
+```
+
+Conceptually it is an immutable ordered contraction program plus a method-specific matching engine.
+
+Transform accepts one raw or schema-`1.0` encoded graph and returns a new schema-`1.0` encoded graph.
+
+Transform MUST:
+
+- not mutate caller input;
+- preserve provenance and active lineage;
+- preserve inherited fitting sizes;
+- match via labels/topology/configured UIDs, not upstream label parsing;
+- use exact occurrence data for rewiring;
+- append one stage record;
+- remain semantically immutable across calls.
+
+A stage model ID already active in the input graph MUST be rejected.
+
+## 17. Decoder artifact
+
+A fitted decoder exposes:
+
+```python
+decoder.model_id
+decoder.rules
+decoder.vocab
+```
+
+It owns a composite exactly when:
+
+```python
+isinstance(type_value, CompositeType)
+and type_value.model_id == decoder.model_id
+```
+
+The decoder expands only owned types. Earlier-stage types remain opaque until their stage is reached.
+
+## 18. One-layer expansion
+
+Expanding one composite occurrence:
+
+1. splits flat `super_uids` by immediate component site counts;
+2. creates one current node per immediate component;
+3. restores component `type`, `label`, `size`, `super_uids`, and representative `time`;
+4. adds internal component edges from `parent` and `attach`;
+5. splits incoming maps among exposed-root components;
+6. translates outgoing maps to local component sites.
+
+If one outgoing child attaches to several immediate components, leaving that child collapsed would create multiple current parents. Section 19 applies.
+
+## 19. Partial decoding
+
+Stage-local decode supports:
+
+```python
+decode(
+    graph,
+    *,
+    target=None,
+    by="node",           # "node", "label", or "type"
+    recursive=True,
+    boundary_policy="expand",  # or "raise"
+    validate="full",
+)
+```
+
+- `target is None`: complete stage reversal.
+- `by="node"`: select one current node key.
+- `by="label"`: select all owned occurrences with equal matching label.
+- `by="type"`: select all owned occurrences with equal exact type.
+- `recursive=False`: expand one owned layer.
+- `recursive=True`: continue through nested types owned by this stage.
+
+A missing node, nonowned node, or label/type with no owned match raises a selection/ownership error.
+
+Boundary policy:
+
+- `"raise"`: reject before mutating caller input;
+- `"expand"`: compute the least fixed-point closure of same-stage boundary descendants needed to retain one current parent per node.
+
+A valid sequential pipeline decoded in reverse order cannot require expansion of an earlier-stage boundary child. Such a case indicates malformed geometry or out-of-order stage handling and MUST raise.
+
+Partial decoding preserves the active stage record and complete fitting-size mapping.
+
+## 20. Complete stage reversal
+
+A full stage decode:
+
+1. verifies decoder ownership of the latest stage;
+2. recursively expands every type owned by that stage;
+3. verifies that no owned type remains, including nested owned types;
+4. removes the latest stage record;
+5. removes only fitting-size labels introduced by that stage;
+6. returns the preceding encoded graph, or a raw graph if no stages remain.
+
+Final raw materialization:
+
+- keys raw nodes by UID;
+- restores all original node attributes from provenance;
+- reconstructs original parent-child UID edges;
+- restores original nonreserved graph attributes;
+- removes package schema metadata;
+- does not promise raw edge-attribute restoration.
+
+## 21. Coarsener API
+
+```python
+class TreeCoarsener(ABC):
+    encoder_: TreeEncoder | None
+    decoder_: TreeDecoder | None
+
+    def fit(
+        self,
+        graphs: Sequence[nx.DiGraph],
+        *,
+        validate="full",
+    ) -> Self: ...
+
+    def transform(
+        self,
+        graph: nx.DiGraph,
+        *,
+        validate="full",
+    ) -> nx.DiGraph: ...
+
+    def fit_transform(
+        self,
+        graphs: Sequence[nx.DiGraph],
+        *,
+        validate="full",
+    ) -> list[nx.DiGraph]: ...
+
+    def decode(
+        self,
+        graph: nx.DiGraph,
+        *,
+        target=None,
+        by="node",
+        recursive=True,
+        boundary_policy="expand",
+        validate="full",
+    ) -> nx.DiGraph: ...
+```
+
+`inverse_transform` MAY be an exact alias of `decode`.
+
+`fit` accepts a nonempty sequence and returns `self`. It sets paired `encoder_` and `decoder_` artifacts atomically. A failed fit leaves prior fitted state unchanged.
+
+## 22. ParametricStarCoarsener
+
+Constructor semantics:
+
+```python
+d                 # minimum fit-time matching children for one witness
+m                 # minimum number of witnessing parents
+contract_d = d    # transform-time minimum
+```
+
+Fit learns pair `(A, B)` when at least `m` current nodes labeled `A` each have at least `d` current children labeled `B`.
+
+Each learned pair emits one rule:
+
+```python
+operation = "siblings"
+output_label = ("star", A, B)
+output_fitting_size = 2
+parameter_names = ("arity",)
+```
+
+Transform visits current `A` parents in deterministic parent-before-child order. If at least `contract_d` current `B` children exist, it contracts **all** such children into one sibling composite. The parent remains separate.
+
+All qualifying arities share one label. Actual arity and exact component geometry remain in `CompositeType`.
+
+## 23. EdgeBPECoarsener
+
+BPE pair matching uses only:
+
+```python
+(parent_node["label"], child_node["label"])
+```
+
+Exact type, exact node size, arity, and attachment map are not part of the pair key.
+
+Rule frequency is raw matching-edge count, including overlapping occurrences. A deterministic vertex-disjoint subset is actually contracted per merge step.
+
+Supported score concepts include:
+
+```text
+count
+normalized
+size_weighted
+```
+
+Size-aware formulas use label-level fitting sizes, not exact node sizes.
+
+Rule rank `r` emits a stage-namespaced label such as:
+
+```python
+("edge_bpe", model_id, r)
+```
+
+Output fitting size is:
+
+```python
+fitting_size(parent_label) + fitting_size(child_label)
+```
+
+Transformation constructs each exact composite from the actual parent type, child type, and edge attachment map. BPE therefore needs no special knowledge of star arity.
+
+An optimized backend MUST learn the same ordered rules and counts as the reference Python backend. JIT warm-up is a benchmark concern, not a semantic difference.
+
+## 24. NamedVertexCoarsener
+
+Exactly one selection mode is configured:
+
+```python
+uids={...}
+# or
+labels={...}
+```
+
+Both arguments are explicit nonempty collections. A single tuple-valued label or UID is wrapped in a set or list to avoid tuple/collection ambiguity.
+
+UID selection chooses a current occurrence only when all of its `super_uids` are selected. Partial overlap raises rather than selecting the whole supernode.
+
+Label selection uses ordinary current matching-label equality.
+
+Component policies:
+
+```python
+"all"      # every maximal qualifying connected current component
+"largest"  # one deterministic largest component
+```
+
+Singletons remain unchanged.
+
+One fitted named-component rule uses one fixed output label and a configured positive fitting size, defaulting to 1. Exact component topology remains occurrence-specific.
+
+## 25. Lazy composition
+
+```python
+combine(
+    encoders: Sequence[TreeEncoder],
+    decoders: Sequence[TreeDecoder],
+) -> tuple[TreeEncoder, TreeDecoder]
+```
+
+Encoders are supplied in application order and run forward. Decoders are paired in the same order and run in reverse.
+
+`combine` rejects:
+
+- empty or unequal-length sequences;
+- mismatched encoder/decoder model IDs;
+- mismatched paired rules or vocabularies;
+- duplicate stage model IDs, including nested combined pipelines;
+- conflicting fitting sizes for one label;
+- unsupported schema versions.
+
+Combined targeted partial decoding is deferred; callers use the current component decoder directly.
+
+Materialized composition is not part of schema `1.0`.
+
+## 26. Validation modes
+
+```python
+ValidationLevel = Literal["full", "structural", False]
+```
+
+`"full"` checks topology, all schema fields, type/label/size equations, provenance partition, representative times, fitting-size closure, lineage ownership, attachment bounds, and deterministic output conventions.
+
+`"structural"` checks everything required for safe rewiring and decoding, while permitting omission of expensive global provenance/time scans.
+
+`False` skips optional eager scans but does not change semantics. Operations still reject missing or malformed information when they use it. It never authorizes geometry inference from labels, invented provenance, invalid attachments, non-tree outputs, ownership bypass, or unsupported schema versions.
+
+## 27. Determinism
+
+Given the same fitted artifact and semantically equal input, transform and decode MUST be deterministic apart from an automatically generated model ID.
+
+Methods define deterministic behavior for:
+
+- fit traversal;
+- sibling/component order;
+- pair-score ties;
+- overlapping occurrence selection;
+- rule numbering;
+- UID concatenation;
+- output node numbering.
+
+Package-generated labels use stable primitive tuples. Custom UIDs SHOULD have stable representation if they participate in ordering ties.
+
+## 28. Errors
+
+Recommended public hierarchy:
+
+```text
+TreeCoarseningError
+├── ConfigurationError
+├── InternalInvariantError
+├── NotFittedError
+├── ValidationError
+│   ├── GraphSchemaError
+│   ├── TreeStructureError
+│   ├── LabelMetadataError
+│   ├── FittingSizeError
+│   ├── ExactTypeError
+│   ├── AttachmentError
+│   ├── ProvenanceError
+│   ├── StageOrderError
+│   └── TypeOwnershipError
+├── DecodeSelectionError
+│   └── TargetNotFoundError
+├── BoundaryExpansionError
+└── CompositionError
+```
+
+Public errors identify the violated concept and relevant node, edge, model ID, or rule when practical.
+
+## 29. Nonmutation and failure atomicity
+
+Public fit, transform, decode, and composition operations MUST NOT mutate caller graphs.
+
+A failed public operation leaves caller graphs unchanged. A failed refit leaves the prior fitted artifacts and public fit diagnostics unchanged.
+
+Only top-level graph/node/edge attribute mappings require isolation. Deep-copy isolation of arbitrary nested mutable user values is deferred.
+
+Fitted artifacts are semantically immutable. Private caches MAY change if they do not alter rule meaning, vocabulary, equality of results, or inspection output.
+
+## 30. Persistence and versioning
+
+No pickle compatibility is promised.
+
+A future persistence API SHOULD use a versioned plain-data state representation such as:
+
+```python
+encoder.to_state()
+TreeEncoder.from_state(state)
+```
+
+Package version, encoded graph schema version, and future artifact serialization version are distinct.
+
+A schema-`1.0` implementation rejects unsupported graph schema versions explicitly. No migration layer is required.
+
+## 31. Contributor conformance obligations
+
+Every new coarsener documents and tests:
+
+1. fitting criterion;
+2. rule application order;
+3. output-label construction;
+4. output fitting-size formula;
+5. omitted parametric fields;
+6. deterministic ties and overlap handling;
+7. exact contraction selection constraints;
+8. raw and encoded input support;
+9. equal-label variable-geometry support;
+10. full and partial stage decoding;
+11. one-stage and multi-stage round trips;
+12. input nonmutation and failure atomicity;
+13. malformed-input rejection;
+14. backend parity when optimized implementations exist.
+
+Reusable conformance tests SHOULD cover:
+
+- raw normalization;
+- schema and provenance equations;
+- variable geometry per label;
+- broad sibling attachment maps;
+- partial boundary expansion;
+- stage ownership and order;
+- fitting-size restoration;
+- deterministic output;
+- randomized multi-stage round trips;
+- reference/optimized backend parity.
+
+## 32. Locked schema-1 decisions
+
+1. Labels are matching identities, not structural recipes.
+2. Equal labels may have variable exact geometry.
+3. Exact structure lives in occurrence-specific `CompositeType` values.
+4. Exact `size` and label-level fitting size are distinct.
+5. Parametric matching is achieved by label design, not wildcard-aware downstream code.
+6. One generic encoder/decoder architecture supports parametric and nonparametric rules.
+7. Encoded edges use tuple-valued `attach_map` only.
+8. Broad sibling contraction is valid.
+9. Flat `super_uids` is the required occurrence provenance field.
+10. There is no public fixed-geometry registry or static recipe vocabulary.
+11. Graphs carry exact active stage lineage and fitting-size closure.
+12. Full stage reversal restores the immediately preceding metadata state.
+13. Partial decoding either preserves a tree through minimal boundary expansion or raises.
+14. Public graph operations are nonmutating.
+15. Raw node and graph attributes round-trip; raw edge attributes do not.
+16. Unsupported schema versions fail explicitly.
+17. Persistence and materialized composition are deferred.

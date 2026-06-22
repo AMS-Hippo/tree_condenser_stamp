@@ -1,279 +1,318 @@
-"""Canonical graph schema shared by all tree coarseners.
-
-The public object remains ``networkx.DiGraph``.  This module centralizes the
-small normalization layer that lets raw trees and previously transformed trees
-be consumed through the same fitting interface.
-
-Every normalized node has:
-
-``label``
-    Hashable symbol used by statistical fitting.
-``type``
-    Exact structural/decoder type. Several exact structural variants may share
-    one fitting ``label``.
-``size``
-    Positive number of represented original vertices/sites.
-``time``
-    Numeric representative timestamp.  Contractions use the maximum component
-    timestamp.
-``super_label``
-    Recipe-aligned provenance payload. Raw nodes use their UID; transformed
-    occurrences preserve the nested component structure needed by stage-local
-    decoding.
-``super_uids``
-    Backward-compatible flat UID tuple used by the current decoder.
-
-Edges may omit ``attach_map`` only for raw input, in which case ``(0,)`` is
-materialized on the normalized copy.
-"""
+"""Raw normalization and graph-level schema-1 metadata."""
 
 from __future__ import annotations
 
-from collections.abc import Hashable as HashableABC, Sequence
-from numbers import Integral, Real
-from typing import Any, TypeAlias
+from collections.abc import Hashable as HashableABC, Mapping, Sequence
+from math import isfinite
+from numbers import Real
+from typing import Any, Literal, TypeAlias
 
 import networkx as nx
 
-from .exceptions import ValidationError
-from .provenance import get_node_attrs_by_uid, normalize_super_uids
-from .vocabulary import Token, base_token, normalize_attach_map
+from .encoder import Vocabulary
+from .exceptions import (
+    AttachmentError,
+    FittingSizeError,
+    GraphSchemaError,
+    LabelMetadataError,
+    ProvenanceError,
+    StageOrderError,
+)
+from .provenance import (
+    NODE_ATTRS_KEY,
+    PROVENANCE_KEY,
+    normalize_provenance,
+    normalize_super_uids,
+    snapshot_raw_provenance,
+)
+from .structural import ExactType, MatchingLabel, base_type
 
-GraphInput: TypeAlias = nx.DiGraph | Sequence[nx.DiGraph]
-RAW_INPUT_FLAG = "tree_coarsening_input_was_raw"
+SCHEMA_VERSION = "1.0"
+SCHEMA_KEY = "tree_coarsening_schema"
+FITTING_SIZES_KEY = "tree_coarsening_fitting_sizes"
+NODE_FIELDS = ("label", "type", "size", "time", "super_uids")
+EDGE_FIELDS = ("attach_map",)
+RESERVED_GRAPH_KEYS = (SCHEMA_KEY, FITTING_SIZES_KEY, PROVENANCE_KEY)
 
-
-def as_graph_list(graphs: GraphInput, *, argument_name: str = "graphs") -> tuple[list[nx.DiGraph], bool]:
-    """Normalize one graph or a graph sequence to ``(list, was_single)``."""
-
-    if isinstance(graphs, nx.DiGraph):
-        return [graphs], True
-    if isinstance(graphs, (str, bytes, bytearray)):
-        raise TypeError(f"{argument_name} must be a DiGraph or a sequence of DiGraphs.")
-    try:
-        out = list(graphs)
-    except TypeError as exc:  # pragma: no cover - defensive
-        raise TypeError(
-            f"{argument_name} must be a DiGraph or a sequence of DiGraphs."
-        ) from exc
-    if not out:
-        raise ValueError(f"{argument_name} requires at least one graph.")
-    if not all(isinstance(graph, nx.DiGraph) and not graph.is_multigraph() for graph in out):
-        raise TypeError(f"every element of {argument_name} must be a networkx.DiGraph.")
-    return out, False
-
-
-def flatten_super_label(value: Any) -> tuple[Any, ...]:
-    """Flatten a nested provenance payload into a left-to-right UID tuple."""
-
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        out: list[Any] = []
-        for item in value:
-            out.extend(flatten_super_label(item))
-        return tuple(out)
-    if not isinstance(value, HashableABC):
-        raise ValidationError(f"super_label leaves must be hashable; got {value!r}.")
-    return (value,)
+ValidationLevel: TypeAlias = Literal["full", "structural", False]
+StageRecord: TypeAlias = dict[str, Any]
 
 
-def node_structural_type(
-    data: dict[str, Any],
-    *,
-    label_attr: str = "label",
-    type_attr: str = "type",
-) -> Token:
-    """Return a node's exact structural type with raw-input fallback."""
-
-    if type_attr in data:
-        token = data[type_attr]
-    else:
-        label = data[label_attr]
-        # Raw string labels are represented structurally as implicit base tokens;
-        # transformed hashable labels already denote their own stage symbol/type.
-        token = base_token(label) if isinstance(label, str) else label
-    if not isinstance(token, HashableABC):
-        raise ValidationError(f"node type must be hashable; got {token!r}.")
-    return token
+def normalize_validation_level(value: Any) -> ValidationLevel:
+    if value is False or value == "full" or value == "structural":
+        return value
+    raise ValueError("validate must be 'full', 'structural', or False.")
 
 
-def _infer_super_fields(
-    node: Any,
-    data: dict[str, Any],
-    *,
-    uid_attr: str,
-    super_label_attr: str,
-    super_uid_attr: str,
-) -> tuple[Any, tuple[Any, ...]]:
-    # Prefer the unambiguous flat compatibility field when both are present.
-    # A UID may itself be a tuple, which makes a scalar tuple-valued
-    # ``super_label`` impossible to distinguish from nested provenance without
-    # its accompanying ``super_uids`` field.
-    if super_uid_attr in data:
-        flat = normalize_super_uids(data[super_uid_attr])
-        super_label = data.get(
-            super_label_attr,
-            flat[0] if len(flat) == 1 else flat,
-        )
-    elif super_label_attr in data:
-        super_label = data[super_label_attr]
-        flat = flatten_super_label(super_label)
-    else:
-        uid = data.get(uid_attr, node)
-        if not isinstance(uid, HashableABC):
-            raise ValidationError(f"uid for node {node!r} must be hashable; got {uid!r}.")
-        super_label = uid
-        flat = (uid,)
-    return super_label, flat
+def normalize_attach_map(value: Any, *, context: str = "attach_map") -> tuple[int, ...]:
+    if not isinstance(value, tuple):
+        raise AttachmentError(f"{context} must be a tuple; got {type(value).__name__}.")
+    for i, site in enumerate(value):
+        if not isinstance(site, int) or isinstance(site, bool):
+            raise AttachmentError(f"{context}[{i}] must be an integer; got {site!r}.")
+    return value
 
 
-def _infer_time(
-    G: nx.DiGraph,
-    data: dict[str, Any],
-    super_uids: tuple[Any, ...],
-    *,
-    time_attr: str,
-) -> float:
-    if time_attr in data:
-        value = data[time_attr]
-        if not isinstance(value, Real) or isinstance(value, bool):
-            raise ValidationError(f"node time must be numeric; got {value!r}.")
-        return float(value)
-
-    provenance = get_node_attrs_by_uid(G)
-    values: list[float] = []
-    for uid in super_uids:
-        attrs = provenance.get(uid)
-        if attrs is None or time_attr not in attrs:
-            raise ValidationError(
-                f"node is missing {time_attr!r} and provenance has no time for UID {uid!r}."
-            )
-        value = attrs[time_attr]
-        if not isinstance(value, Real) or isinstance(value, bool):
-            raise ValidationError(f"provenance time for UID {uid!r} is not numeric: {value!r}.")
-        values.append(float(value))
-    if not values:
-        raise ValidationError("cannot infer a representative time from empty provenance.")
-    return max(values)
-
-
-def normalize_coarsenable_tree(
-    G: nx.DiGraph,
-    *,
-    label_attr: str = "label",
-    type_attr: str = "type",
-    size_attr: str = "size",
-    time_attr: str = "time",
-    uid_attr: str = "uid",
-    super_label_attr: str = "super_label",
-    super_uid_attr: str = "super_uids",
-    attach_attr: str = "attach_map",
-    copy: bool = True,
-) -> nx.DiGraph:
-    """Return a canonical fitting-tree view of raw or transformed input.
-
-    The function deliberately performs no vocabulary lookup and never requires
-    attachment metadata for fitting.  Missing raw-edge attachment maps are
-    materialized only so the same returned graph can later be transformed.
-    """
-
-    was_raw = G.graph.get(
-        RAW_INPUT_FLAG,
-        all(
-            type_attr not in data
-            and size_attr not in data
-            and super_label_attr not in data
-            and super_uid_attr not in data
-            for _node, data in G.nodes(data=True)
-        ),
-    )
-    H = G.copy(as_view=False) if copy else G
-    H.graph[RAW_INPUT_FLAG] = bool(was_raw)
-    for node, data in H.nodes(data=True):
-        if label_attr not in data:
-            raise ValidationError(f"node {node!r} is missing {label_attr!r}.")
-        label = data[label_attr]
+def normalize_fitting_sizes(value: Any) -> dict[MatchingLabel, int]:
+    if not isinstance(value, Mapping):
+        raise FittingSizeError(f"{FITTING_SIZES_KEY!r} must be a mapping.")
+    out: dict[MatchingLabel, int] = {}
+    for label, size in value.items():
         if not isinstance(label, HashableABC):
-            raise ValidationError(f"node {node!r} has non-hashable label {label!r}.")
-
-        super_label, super_uids = _infer_super_fields(
-            node,
-            data,
-            uid_attr=uid_attr,
-            super_label_attr=super_label_attr,
-            super_uid_attr=super_uid_attr,
-        )
-        size = data.get(size_attr, len(super_uids))
-        if not isinstance(size, Integral) or isinstance(size, bool) or int(size) <= 0:
-            raise ValidationError(f"node {node!r} has invalid positive integer size {size!r}.")
-        size = int(size)
-        if size != len(super_uids):
-            raise ValidationError(
-                f"node {node!r} has size={size}, but its provenance contains "
-                f"{len(super_uids)} original UIDs."
+            raise LabelMetadataError(f"fitting-size label must be hashable: {label!r}.")
+        try:
+            hash(label)
+        except Exception as exc:
+            raise LabelMetadataError(
+                f"fitting-size label cannot be hashed reliably: {label!r}."
+            ) from exc
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise FittingSizeError(
+                f"fitting size for {label!r} must be a positive integer; got {size!r}."
             )
-
-        data[type_attr] = node_structural_type(data, label_attr=label_attr, type_attr=type_attr)
-        data[size_attr] = size
-        data[time_attr] = _infer_time(H, data, super_uids, time_attr=time_attr)
-        data[super_label_attr] = super_label
-        data[super_uid_attr] = tuple(super_uids)
-        data.setdefault(uid_attr, node)
-
-    for _u, _v, data in H.edges(data=True):
-        if attach_attr in data:
-            data[attach_attr] = normalize_attach_map(data[attach_attr])
-        elif "attach_index" in data:
-            data[attach_attr] = normalize_attach_map(data["attach_index"])
-        else:
-            data[attach_attr] = (0,)
-    return H
+        out[label] = int(size)
+    return out
 
 
-def max_component_time(*values: Real) -> float:
-    """Canonical timestamp aggregation for contractions."""
+def normalize_stage_records(value: Any) -> tuple[StageRecord, ...]:
+    if not isinstance(value, tuple):
+        raise GraphSchemaError("schema 'stages' must be a tuple.")
+    out: list[StageRecord] = []
+    seen: set[str] = set()
+    introduced_by: dict[MatchingLabel, str] = {}
+    for i, record in enumerate(value):
+        if not isinstance(record, Mapping):
+            raise GraphSchemaError(f"stage {i} must be a mapping.")
+        if set(record) != {"model_id", "introduced_labels"}:
+            raise GraphSchemaError(
+                f"stage {i} must contain exactly 'model_id' and 'introduced_labels'."
+            )
+        model_id = record["model_id"]
+        labels = record["introduced_labels"]
+        if not isinstance(model_id, str) or not model_id:
+            raise GraphSchemaError(f"stage {i} has invalid model_id {model_id!r}.")
+        if model_id in seen:
+            raise StageOrderError(f"duplicate active model_id {model_id!r}.")
+        seen.add(model_id)
+        if not isinstance(labels, tuple):
+            raise GraphSchemaError(f"stage {i} introduced_labels must be a tuple.")
+        stage_labels: set[MatchingLabel] = set()
+        for label in labels:
+            if not isinstance(label, HashableABC):
+                raise LabelMetadataError(f"stage {i} introduced label is not hashable: {label!r}.")
+            try:
+                hash(label)
+            except Exception as exc:
+                raise LabelMetadataError(
+                    f"stage {i} introduced label cannot be hashed reliably: {label!r}."
+                ) from exc
+            if label in stage_labels:
+                raise GraphSchemaError(f"stage {i} introduced_labels contains duplicates.")
+            stage_labels.add(label)
+            previous_owner = introduced_by.get(label)
+            if previous_owner is not None:
+                raise StageOrderError(
+                    f"label {label!r} is introduced by more than one stage: "
+                    f"{previous_owner!r} and {model_id!r}."
+                )
+            introduced_by[label] = model_id
+        out.append({"model_id": model_id, "introduced_labels": tuple(labels)})
+    return tuple(out)
 
-    if not values:
-        raise ValueError("max_component_time requires at least one value.")
-    if any(not isinstance(value, Real) or isinstance(value, bool) for value in values):
-        raise ValidationError(f"all component times must be numeric; got {values!r}.")
-    return float(max(values))
+
+def normalize_schema_record(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise GraphSchemaError(f"{SCHEMA_KEY!r} must be a mapping.")
+    if set(value) != {"version", "stages"}:
+        raise GraphSchemaError("schema record must contain exactly 'version' and 'stages'.")
+    version = value["version"]
+    if version != SCHEMA_VERSION:
+        raise GraphSchemaError(
+            f"unsupported tree-coarsening schema {version!r}; expected {SCHEMA_VERSION!r}."
+        )
+    return {"version": SCHEMA_VERSION, "stages": normalize_stage_records(value["stages"])}
+
+
+def is_encoded_graph(graph: nx.DiGraph) -> bool:
+    return SCHEMA_KEY in graph.graph
+
+
+def graph_stages(graph: nx.DiGraph) -> tuple[StageRecord, ...]:
+    return normalize_schema_record(graph.graph[SCHEMA_KEY])["stages"]
+
+
+def get_graph_fitting_sizes(graph: nx.DiGraph) -> dict[MatchingLabel, int]:
+    return normalize_fitting_sizes(graph.graph[FITTING_SIZES_KEY])
+
+
+def get_graph_provenance(graph: nx.DiGraph) -> dict[str, Any]:
+    return normalize_provenance(graph.graph[PROVENANCE_KEY])
+
+
+def representative_time(
+    super_uids: tuple[Any, ...],
+    provenance: Mapping[str, Any],
+) -> float:
+    flat = normalize_super_uids(super_uids)
+    node_attrs = provenance[NODE_ATTRS_KEY]
+    values: list[float] = []
+    for uid in flat:
+        try:
+            raw_time = node_attrs[uid]["time"]
+        except KeyError as exc:
+            raise ProvenanceError(f"missing provenance time for UID {uid!r}.") from exc
+        if (
+            not isinstance(raw_time, Real)
+            or isinstance(raw_time, bool)
+            or not isfinite(float(raw_time))
+        ):
+            raise ProvenanceError(f"invalid provenance time for UID {uid!r}: {raw_time!r}.")
+        values.append(float(raw_time))
+    return max(values)
 
 
 def encoded_node_attrs(
     *,
-    label: Any,
-    type_token: Any,
+    label: MatchingLabel,
+    type: ExactType,
     size: int,
-    time: Real,
-    super_label: Any,
-    super_uids: Sequence[Any],
-    label_attr: str = "label",
-    type_attr: str = "type",
-    size_attr: str = "size",
-    time_attr: str = "time",
-    super_label_attr: str = "super_label",
-    super_uid_attr: str = "super_uids",
+    time: float,
+    super_uids: tuple[Any, ...],
 ) -> dict[str, Any]:
-    """Construct the canonical node-attribute payload emitted by coarseners."""
-
-    uids = tuple(super_uids)
-    if not isinstance(label, HashableABC):
-        raise ValidationError(f"encoded label must be hashable; got {label!r}.")
-    if not isinstance(type_token, HashableABC):
-        raise ValidationError(f"encoded type must be hashable; got {type_token!r}.")
-    if not isinstance(size, Integral) or isinstance(size, bool) or int(size) <= 0:
-        raise ValidationError(f"encoded size must be a positive integer; got {size!r}.")
-    if int(size) != len(uids):
-        raise ValidationError(
-            f"encoded size={size} does not match {len(uids)} represented UIDs."
-        )
-    if not isinstance(time, Real) or isinstance(time, bool):
-        raise ValidationError(f"encoded time must be numeric; got {time!r}.")
     return {
-        label_attr: label,
-        type_attr: type_token,
-        size_attr: int(size),
-        time_attr: float(time),
-        super_label_attr: super_label,
-        super_uid_attr: uids,
+        "label": label,
+        "type": type,
+        "size": size,
+        "time": float(time),
+        "super_uids": tuple(super_uids),
     }
+
+
+def _check_graph_type(graph: Any) -> None:
+    if not isinstance(graph, nx.DiGraph) or graph.is_multigraph():
+        raise GraphSchemaError("graph must be a non-multigraph networkx.DiGraph.")
+
+
+def normalize_raw_graph(graph: nx.DiGraph) -> nx.DiGraph:
+    from .validation import validate_raw_tree
+
+    _check_graph_type(graph)
+    validate_raw_tree(graph)
+    provenance = snapshot_raw_provenance(graph)
+
+    out = nx.DiGraph()
+    out.graph[SCHEMA_KEY] = {"version": SCHEMA_VERSION, "stages": ()}
+    out.graph[FITTING_SIZES_KEY] = {data["label"]: 1 for _node, data in graph.nodes(data=True)}
+    out.graph[PROVENANCE_KEY] = provenance
+    for node, data in graph.nodes(data=True):
+        label = data["label"]
+        out.add_node(
+            node,
+            **encoded_node_attrs(
+                label=label,
+                type=base_type(label),
+                size=1,
+                time=float(data["time"]),
+                super_uids=(data["uid"],),
+            ),
+        )
+    for parent, child in graph.edges:
+        out.add_edge(parent, child, attach_map=(0,))
+    return out
+
+
+def copy_encoded_graph(graph: nx.DiGraph) -> nx.DiGraph:
+    out = nx.DiGraph()
+    schema = normalize_schema_record(graph.graph[SCHEMA_KEY])
+    out.graph[SCHEMA_KEY] = {
+        "version": schema["version"],
+        "stages": tuple(dict(record) for record in schema["stages"]),
+    }
+    out.graph[FITTING_SIZES_KEY] = get_graph_fitting_sizes(graph)
+    out.graph[PROVENANCE_KEY] = get_graph_provenance(graph)
+    for node, data in graph.nodes(data=True):
+        out.add_node(node, **dict(data))
+    for parent, child, data in graph.edges(data=True):
+        out.add_edge(parent, child, **dict(data))
+    return out
+
+
+def prepare_graph(
+    graph: nx.DiGraph,
+    *,
+    validate: ValidationLevel = "full",
+) -> nx.DiGraph:
+    from .validation import validate_encoded_tree
+
+    level = normalize_validation_level(validate)
+    _check_graph_type(graph)
+    reserved_present = [key for key in RESERVED_GRAPH_KEYS if key in graph.graph]
+    if not reserved_present:
+        return normalize_raw_graph(graph)
+    if set(reserved_present) != set(RESERVED_GRAPH_KEYS):
+        raise GraphSchemaError(
+            "encoded metadata is incomplete; schema, fitting sizes, and provenance are all required."
+        )
+    out = copy_encoded_graph(graph)
+    validate_encoded_tree(out, level=level)
+    return out
+
+
+def append_stage(
+    graph: nx.DiGraph,
+    *,
+    model_id: str,
+    vocab: Vocabulary,
+) -> None:
+    schema = normalize_schema_record(graph.graph[SCHEMA_KEY])
+    stages = schema["stages"]
+    active_ids = {record["model_id"] for record in stages}
+    if model_id in active_ids:
+        raise StageOrderError(f"model_id {model_id!r} is already active in this lineage.")
+
+    sizes = get_graph_fitting_sizes(graph)
+    introduced: list[MatchingLabel] = []
+    for label in vocab.labels:
+        size = vocab.fitting_size(label)
+        previous = sizes.get(label)
+        if previous is None:
+            sizes[label] = size
+            introduced.append(label)
+        elif previous != size:
+            raise FittingSizeError(
+                f"stage label {label!r} has fitting size {size}, but input metadata has {previous}."
+            )
+    graph.graph[FITTING_SIZES_KEY] = sizes
+    graph.graph[SCHEMA_KEY] = {
+        "version": SCHEMA_VERSION,
+        "stages": stages + ({"model_id": model_id, "introduced_labels": tuple(introduced)},),
+    }
+
+
+def pop_latest_stage(graph: nx.DiGraph, *, model_id: str) -> None:
+    schema = normalize_schema_record(graph.graph[SCHEMA_KEY])
+    stages = schema["stages"]
+    if not stages or stages[-1]["model_id"] != model_id:
+        actual = None if not stages else stages[-1]["model_id"]
+        raise StageOrderError(
+            f"decoder {model_id!r} does not own the latest active stage {actual!r}."
+        )
+    latest = stages[-1]
+    sizes = get_graph_fitting_sizes(graph)
+    for label in latest["introduced_labels"]:
+        sizes.pop(label, None)
+    graph.graph[FITTING_SIZES_KEY] = sizes
+    graph.graph[SCHEMA_KEY] = {"version": SCHEMA_VERSION, "stages": stages[:-1]}
+
+
+def fit_corpus_fitting_sizes(graphs: Sequence[nx.DiGraph]) -> dict[MatchingLabel, int]:
+    out: dict[MatchingLabel, int] = {}
+    for graph in graphs:
+        for label, size in get_graph_fitting_sizes(graph).items():
+            previous = out.get(label)
+            if previous is not None and previous != size:
+                raise FittingSizeError(
+                    f"fit corpus gives label {label!r} conflicting sizes {previous} and {size}."
+                )
+            out[label] = size
+    return out

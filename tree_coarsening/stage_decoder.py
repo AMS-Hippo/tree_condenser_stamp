@@ -1,282 +1,313 @@
-"""Stage-local decoder for exact :class:`CompositeType` occurrences.
-
-Unlike the legacy staged decoder, this decoder expands only structural types
-owned by one fitted coarsener.  Earlier-stage types are opaque terminals, so a
-BPE decoder can recover the preceding Star-encoded graph without understanding
-or importing the Star vocabulary.
-"""
+"""Generic occurrence-driven decoder for one fitted schema-1 stage."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Hashable, Literal
+from bisect import bisect_right
+from collections.abc import Hashable
+from typing import Any
 
 import networkx as nx
 
-from .decoder import DecodeBy, TreeDecoder
-from .exceptions import ValidationError
-from .nx_io import edge_attach_attrs, relabel_to_consecutive_topological
-from .provenance import copy_graph_provenance, get_node_attrs_by_uid, normalize_super_uids
-from .schema import encoded_node_attrs, max_component_time
-from .structural import CompositeType, component_super_labels
-from .validation import validate_encoded_tree, validate_raw_tree
-from .vocabulary import Token, is_base_token, normalize_attach_map, raw_label_from_base_token
+from .decoder import TreeDecoder
+from .exceptions import (
+    BoundaryExpansionError,
+    DecodeSelectionError,
+    ExactTypeError,
+    FittingSizeError,
+    ProvenanceError,
+    StageOrderError,
+    TargetNotFoundError,
+    TypeOwnershipError,
+)
+from .provenance import GRAPH_ATTRS_KEY, NODE_ATTRS_KEY, normalize_super_uids, split_super_uids
+from .schema import (
+    PROVENANCE_KEY,
+    encoded_node_attrs,
+    get_graph_fitting_sizes,
+    graph_stages,
+    normalize_attach_map,
+    pop_latest_stage,
+    prepare_graph,
+    representative_time,
+)
+from .structural import (
+    CompositeType,
+    exact_root_count,
+    exact_site_count,
+    exact_type_label,
+    is_base_type,
+    iter_exact_types,
+)
+from .validation import (
+    deterministic_node_order,
+    relabel_to_consecutive_parent_first,
+    validate_encoded_tree,
+    validate_raw_tree,
+)
 
 
-class _BoundaryExpansionRequired(Exception):
+class _BoundaryRequired(Exception):
     def __init__(self, child: Hashable) -> None:
         self.child = child
-        super().__init__(f"boundary child {child!r} must be expanded first")
 
 
-@dataclass
 class StructuralStageDecoder(TreeDecoder):
-    """Decode exact types created by one coarsener stage.
+    """Decode composites owned by one ``model_id`` using exact occurrence data."""
 
-    Parameters
-    ----------
-    output_raw:
-        If true, a complete decode materializes raw UID-keyed vertices after all
-        owned structural types have been expanded.  If false, complete decode
-        returns the previous encoded-tree stage.
-    """
-
-    output_raw: bool = True
+    def _owns(self, value: Any) -> bool:
+        return isinstance(value, CompositeType) and value.model_id == self.model_id
 
     def decode(
         self,
-        H: nx.DiGraph,
+        graph: nx.DiGraph,
         *,
-        target: Hashable | Token | None = None,
-        by: DecodeBy = "node",
+        target: Hashable | None = None,
+        by: str = "node",
         recursive: bool = True,
-        boundary_policy: Literal["expand", "raise"] = "expand",
-        validate: bool = True,
+        boundary_policy: str = "expand",
+        validate: str | bool = "full",
     ) -> nx.DiGraph:
         if by not in {"node", "label", "type"}:
-            raise ValueError("by must be 'node', 'label', or 'type'.")
+            raise DecodeSelectionError("by must be 'node', 'label', or 'type'.")
+        if not isinstance(recursive, bool):
+            raise DecodeSelectionError("recursive must be Boolean.")
         if boundary_policy not in {"expand", "raise"}:
-            raise ValueError("boundary_policy must be 'expand' or 'raise'.")
+            raise DecodeSelectionError("boundary_policy must be 'expand' or 'raise'.")
 
-        if validate:
-            validate_encoded_tree(
-                H,
-                vocab=self.vocab,
-                label_attr=self.label_attr,
-                type_attr=self.type_attr,
-                size_attr=self.size_attr,
-                time_attr=self.time_attr,
-                super_label_attr=self.super_label_attr,
-                super_uid_attr=self.super_uid_attr,
-                attach_attr=self.attach_attr,
+        current = prepare_graph(graph, validate=validate)
+        stages = graph_stages(current)
+        active_ids = {record["model_id"] for record in stages}
+        if self.model_id not in active_ids:
+            raise StageOrderError(f"model_id {self.model_id!r} is not active in this graph.")
+        if stages[-1]["model_id"] != self.model_id:
+            raise StageOrderError(
+                f"decoder {self.model_id!r} does not own latest stage {stages[-1]['model_id']!r}."
             )
+        self._validate_artifact_against_graph(current, stages[-1])
 
-        graph = H.copy(as_view=False)
-        selected = self._select_targets(graph, target=target, by=by)
         if target is None:
-            recursive = True
+            while True:
+                selected = tuple(
+                    node
+                    for node in deterministic_node_order(current)
+                    if self._owns(current.nodes[node]["type"])
+                )
+                if not selected:
+                    break
+                self._expand_selected(
+                    current,
+                    selected,
+                    recursive=True,
+                    boundary_policy="expand",
+                )
+            leftovers = [
+                (node, nested)
+                for node, data in current.nodes(data=True)
+                for nested in iter_exact_types(data["type"])
+                if self._owns(nested)
+            ]
+            if leftovers:
+                raise TypeOwnershipError(
+                    f"complete decode left types owned by {self.model_id!r}: {leftovers!r}."
+                )
+            pop_latest_stage(current, model_id=self.model_id)
+            if not graph_stages(current):
+                return self._materialize_raw(current)
+            current = relabel_to_consecutive_parent_first(current)
+            validate_encoded_tree(current, level=validate)
+            return current
 
-        self._decode_selected(
-            graph,
+        selected = self._select(current, target=target, by=by)
+        self._expand_selected(
+            current,
             selected,
             recursive=recursive,
             boundary_policy=boundary_policy,
         )
-        graph = relabel_to_consecutive_topological(graph)
+        current = relabel_to_consecutive_parent_first(current)
+        validate_encoded_tree(current, level=validate)
+        return current
 
-        if target is None and self.output_raw:
-            return self._materialize_raw(graph, validate=validate)
+    def _validate_artifact_against_graph(
+        self,
+        graph: nx.DiGraph,
+        stage_record: dict[str, Any],
+    ) -> None:
+        """Reject same-ID decoder artifacts that do not describe this stage.
 
-        if validate:
-            validate_encoded_tree(
-                graph,
-                vocab=self.vocab,
-                label_attr=self.label_attr,
-                type_attr=self.type_attr,
-                size_attr=self.size_attr,
-                time_attr=self.time_attr,
-                super_label_attr=self.super_label_attr,
-                super_uid_attr=self.super_uid_attr,
-                attach_attr=self.attach_attr,
+        Schema 1 deliberately stores no fitted-rule fingerprint in graph
+        metadata. The strongest check available without changing that frozen
+        schema is therefore vocabulary-based: every stage-introduced label and
+        every owned composite label must belong to this decoder's vocabulary,
+        and all declared fitting sizes must agree with the graph.
+        """
+
+        graph_sizes = get_graph_fitting_sizes(graph)
+        vocab_sizes = self.vocab.as_dict()
+        introduced = tuple(stage_record["introduced_labels"])
+
+        missing_from_artifact = tuple(label for label in introduced if label not in vocab_sizes)
+        if missing_from_artifact:
+            raise TypeOwnershipError(
+                f"decoder {self.model_id!r} does not declare stage-introduced labels "
+                f"{missing_from_artifact!r}."
             )
-        return graph
+        vocab_positions = {label: i for i, label in enumerate(self.vocab.labels)}
+        introduced_positions = tuple(vocab_positions[label] for label in introduced)
+        if introduced_positions != tuple(sorted(introduced_positions)):
+            raise TypeOwnershipError(
+                f"stage {self.model_id!r} introduced-label order disagrees with the "
+                "decoder vocabulary."
+            )
 
-    def flatten_super_uids(self, token: Token, super_uids: Any) -> tuple[Any, ...]:
-        return normalize_super_uids(super_uids)
+        for label, expected_size in vocab_sizes.items():
+            actual_size = graph_sizes.get(label)
+            if actual_size is None:
+                raise FittingSizeError(
+                    f"decoder {self.model_id!r} declares label {label!r}, but the active "
+                    "graph has no fitting size for it."
+                )
+            if actual_size != expected_size:
+                raise FittingSizeError(
+                    f"decoder {self.model_id!r} declares label {label!r} with fitting "
+                    f"size {expected_size}, but the graph records {actual_size}."
+                )
 
-    def _is_owned_type(self, type_token: Any) -> bool:
-        return isinstance(type_token, CompositeType) and type_token.model_id == self.model_id
+        owned_labels = {
+            nested.label
+            for _node, data in graph.nodes(data=True)
+            for nested in iter_exact_types(data["type"])
+            if self._owns(nested)
+        }
+        undeclared = tuple(sorted(owned_labels - set(vocab_sizes), key=repr))
+        if undeclared:
+            raise TypeOwnershipError(
+                f"decoder {self.model_id!r} does not declare owned composite labels {undeclared!r}."
+            )
 
-    def _select_targets(
+    def _select(
         self,
         graph: nx.DiGraph,
         *,
-        target: Hashable | Token | None,
-        by: DecodeBy,
-    ) -> list[Hashable]:
-        if target is None:
-            return [
-                node
-                for node in nx.topological_sort(graph)
-                if self._is_owned_type(graph.nodes[node][self.type_attr])
-            ]
+        target: Hashable,
+        by: str,
+    ) -> tuple[Hashable, ...]:
+        order = deterministic_node_order(graph)
         if by == "node":
             if target not in graph:
-                raise ValidationError(f"target node {target!r} is not in the encoded graph.")
-            return [target]
-        attr = self.label_attr if by == "label" else self.type_attr
-        selected = [node for node, data in graph.nodes(data=True) if data[attr] == target]
-        if not selected:
-            raise ValidationError(f"no encoded nodes match {by}={target!r}.")
-        return selected
+                raise TargetNotFoundError(f"target node {target!r} is absent.")
+            if not self._owns(graph.nodes[target]["type"]):
+                raise TypeOwnershipError(
+                    f"target node {target!r} is not owned by decoder {self.model_id!r}."
+                )
+            return (target,)
 
-    def _decode_selected(
+        field = "label" if by == "label" else "type"
+        matches = tuple(
+            node
+            for node in order
+            if self._owns(graph.nodes[node]["type"]) and graph.nodes[node][field] == target
+        )
+        if not matches:
+            raise TargetNotFoundError(
+                f"no occurrences owned by {self.model_id!r} match {field} {target!r}."
+            )
+        return matches
+
+    def _expand_selected(
         self,
         graph: nx.DiGraph,
-        selected: list[Hashable],
+        selected: tuple[Hashable, ...],
         *,
         recursive: bool,
-        boundary_policy: Literal["expand", "raise"],
+        boundary_policy: str,
     ) -> None:
-        stack = list(selected)
-        queued = set(stack)
-        serial = 0
+        stack: list[tuple[Hashable, bool]] = [(node, recursive) for node in reversed(selected)]
         while stack:
-            node = stack.pop()
-            queued.discard(node)
-            if node not in graph:
-                continue
-            type_token = graph.nodes[node][self.type_attr]
-            if not self._is_owned_type(type_token):
+            node, recurse_descendants = stack.pop()
+            if node not in graph or not self._owns(graph.nodes[node]["type"]):
                 continue
             try:
-                new_nodes = self._expand_one(graph, node, serial=serial)
-                serial += 1
-            except _BoundaryExpansionRequired as requirement:
-                child = requirement.child
+                new_nodes = self._expand_one(graph, node)
+            except _BoundaryRequired as exc:
                 if boundary_policy == "raise":
-                    raise ValidationError(
-                        f"decoding node {node!r} would attach one collapsed child to "
-                        "multiple exposed parent components."
+                    raise BoundaryExpansionError(
+                        f"expanding node {node!r} would give child {exc.child!r} "
+                        "multiple current parents."
                     ) from None
-                if child not in graph or not self._is_owned_type(
-                    graph.nodes[child][self.type_attr]
-                ):
-                    raise ValidationError(
-                        f"boundary child {child!r} belongs to an earlier stage and cannot "
-                        "be expanded by this decoder. This indicates inconsistent stage "
-                        "attachment metadata."
+                if exc.child not in graph or not self._owns(graph.nodes[exc.child]["type"]):
+                    owner = None
+                    if exc.child in graph and isinstance(
+                        graph.nodes[exc.child]["type"], CompositeType
+                    ):
+                        owner = graph.nodes[exc.child]["type"].model_id
+                    raise BoundaryExpansionError(
+                        f"boundary child {exc.child!r} is owned by {owner!r}, not the "
+                        f"current stage {self.model_id!r}."
                     ) from None
-                # Expand the child first, then retry the current node.
-                stack.append(node)
-                stack.append(child)
+                stack.append((node, recurse_descendants))
+                stack.append((exc.child, False))
                 continue
 
-            if recursive:
+            if recurse_descendants:
                 for new_node in reversed(new_nodes):
-                    if (
-                        new_node in graph
-                        and self._is_owned_type(graph.nodes[new_node][self.type_attr])
-                        and new_node not in queued
-                    ):
-                        stack.append(new_node)
-                        queued.add(new_node)
+                    if new_node in graph and self._owns(graph.nodes[new_node]["type"]):
+                        stack.append((new_node, True))
 
     def _expand_one(
         self,
         graph: nx.DiGraph,
         node: Hashable,
-        *,
-        serial: int,
     ) -> tuple[Hashable, ...]:
         data = graph.nodes[node]
-        exact = data[self.type_attr]
-        if not isinstance(exact, CompositeType) or exact.model_id != self.model_id:
+        exact = data["type"]
+        if not self._owns(exact):
             return ()
+        assert isinstance(exact, CompositeType)
 
-        flat_uids = normalize_super_uids(data[self.super_uid_attr])
-        if len(flat_uids) != exact.site_count:
-            raise ValidationError(
-                f"node {node!r} stores {len(flat_uids)} UIDs, but its exact type "
-                f"contains {exact.site_count} sites."
-            )
-        super_labels = component_super_labels(
-            data[self.super_label_attr],
-            component_sizes=exact.component_sizes,
-            flat_uids=flat_uids,
-        )
-        uid_pieces: list[tuple[Any, ...]] = []
-        cursor = 0
-        for size in exact.component_sizes:
-            uid_pieces.append(tuple(flat_uids[cursor : cursor + size]))
-            cursor += size
+        flat_uids = normalize_super_uids(data["super_uids"])
+        component_sizes = tuple(exact_site_count(component) for component in exact.components)
+        uid_pieces = split_super_uids(flat_uids, component_sizes)
+        provenance = graph.graph[PROVENANCE_KEY]
 
         offsets: list[int] = []
-        total = 0
-        for size in exact.component_sizes:
-            offsets.append(total)
-            total += size
+        cursor = 0
+        for size in component_sizes:
+            offsets.append(cursor)
+            cursor += size
+        total_sites = cursor
 
-        def locate_site(site: int) -> tuple[int, int]:
-            if site < 0 or site >= total:
-                raise ValidationError(
-                    f"outgoing attachment site {site} is outside 0..{total - 1}."
+        def locate(site: int) -> tuple[int, int]:
+            if site < 0 or site >= total_sites:
+                raise ExactTypeError(
+                    f"outgoing site {site} is outside composite size {total_sites}."
                 )
-            for component_i in range(len(offsets) - 1, -1, -1):
-                if site >= offsets[component_i]:
-                    return component_i, site - offsets[component_i]
-            raise AssertionError("unreachable")
+            component_i = bisect_right(offsets, site) - 1
+            return component_i, site - offsets[component_i]
 
-        # Preflight outgoing boundaries before mutating the graph.  If a child
-        # must be expanded first, the caller can do so and safely retry.
-        outgoing_routes: list[tuple[Hashable, int, tuple[int, ...]]] = []
-        for _old_parent, outside_child, edge_data in list(graph.out_edges(node, data=True)):
-            attach = normalize_attach_map(edge_data[self.attach_attr])
-            routed = [locate_site(site) for site in attach]
+        outgoing: list[tuple[Hashable, int, tuple[int, ...]]] = []
+        for _parent, child, edge_data in list(graph.out_edges(node, data=True)):
+            attach = normalize_attach_map(
+                edge_data["attach_map"], context=f"edge {(node, child)!r}"
+            )
+            routed = tuple(locate(site) for site in attach)
             component_ids = {component_i for component_i, _local in routed}
             if len(component_ids) != 1:
-                raise _BoundaryExpansionRequired(outside_child)
-            outgoing_routes.append(
-                (
-                    outside_child,
-                    routed[0][0],
-                    tuple(local for _component, local in routed),
-                )
-            )
+                raise _BoundaryRequired(child)
+            component_i = routed[0][0]
+            outgoing.append((child, component_i, tuple(local for _component_i, local in routed)))
 
-        provenance = get_node_attrs_by_uid(graph)
-        component_nodes: list[Hashable] = []
-        for i in range(exact.n_components):
-            key = ("__tc_stage_decode__", self.model_id, node, serial, i)
-            while key in graph:
-                serial += 1
-                key = ("__tc_stage_decode__", self.model_id, node, serial, i)
-            component_nodes.append(key)
+        component_nodes = tuple(object() for _ in exact.components)
+        for i, component in enumerate(exact.components):
             uids = uid_pieces[i]
-            times = [
-                provenance[uid][self.time_attr]
-                for uid in uids
-                if uid in provenance and self.time_attr in provenance[uid]
-            ]
-            if len(times) != len(uids):
-                raise ValidationError(
-                    f"cannot recover all component times while decoding node {node!r}."
-                )
             graph.add_node(
-                key,
+                component_nodes[i],
                 **encoded_node_attrs(
-                    label=exact.component_labels[i],
-                    type_token=exact.component_types[i],
-                    size=exact.component_sizes[i],
-                    time=max_component_time(*times),
-                    super_label=super_labels[i],
+                    label=exact_type_label(component),
+                    type=component,
+                    size=component_sizes[i],
+                    time=representative_time(uids, provenance),
                     super_uids=uids,
-                    label_attr=self.label_attr,
-                    type_attr=self.type_attr,
-                    size_attr=self.size_attr,
-                    time_attr=self.time_attr,
-                    super_label_attr=self.super_label_attr,
-                    super_uid_attr=self.super_uid_attr,
                 ),
             )
 
@@ -286,85 +317,106 @@ class StructuralStageDecoder(TreeDecoder):
             graph.add_edge(
                 component_nodes[parent_i],
                 component_nodes[i],
-                **edge_attach_attrs(exact.attachment_slice(i), attach_attr=self.attach_attr),
+                attach_map=exact.attachment_slice(i),
             )
 
-        predecessors = list(graph.predecessors(node))
+        predecessors = tuple(graph.predecessors(node))
         if len(predecessors) > 1:
-            raise ValidationError(f"encoded node {node!r} has multiple parents.")
+            raise ExactTypeError(f"encoded node {node!r} has multiple parents.")
         if predecessors:
             outside_parent = predecessors[0]
-            incoming = normalize_attach_map(graph.edges[outside_parent, node][self.attach_attr])
+            incoming = normalize_attach_map(
+                graph.edges[outside_parent, node]["attach_map"],
+                context=f"incoming edge to {node!r}",
+            )
             if len(incoming) != exact.root_count:
-                raise ValidationError(
+                raise ExactTypeError(
                     f"incoming edge to {node!r} has {len(incoming)} roots; "
                     f"expected {exact.root_count}."
                 )
             cursor = 0
             for i in exact.root_positions:
-                width = exact.component_root_counts[i]
-                piece = incoming[cursor : cursor + width]
-                cursor += width
+                width = exact_root_count(exact.components[i])
                 graph.add_edge(
                     outside_parent,
                     component_nodes[i],
-                    **edge_attach_attrs(piece, attach_attr=self.attach_attr),
+                    attach_map=tuple(incoming[cursor : cursor + width]),
                 )
+                cursor += width
         elif exact.root_count != 1:
-            raise ValidationError(
-                f"root node {node!r} expands to {exact.root_count} roots rather than one."
-            )
+            raise ExactTypeError(f"root occurrence {node!r} expands to {exact.root_count} roots.")
 
-        for outside_child, component_i, local_map in outgoing_routes:
-            graph.add_edge(
-                component_nodes[component_i],
-                outside_child,
-                **edge_attach_attrs(local_map, attach_attr=self.attach_attr),
-            )
-
+        for child, component_i, local_map in outgoing:
+            graph.add_edge(component_nodes[component_i], child, attach_map=local_map)
         graph.remove_node(node)
-        return tuple(component_nodes)
+        return component_nodes
 
-    def _materialize_raw(self, graph: nx.DiGraph, *, validate: bool) -> nx.DiGraph:
-        provenance = get_node_attrs_by_uid(graph)
+    def _materialize_raw(self, graph: nx.DiGraph) -> nx.DiGraph:
+        provenance = graph.graph[PROVENANCE_KEY]
+        raw_nodes = provenance[NODE_ATTRS_KEY]
+        visible_uids = [
+            uid
+            for _node, data in graph.nodes(data=True)
+            for uid in normalize_super_uids(data["super_uids"])
+        ]
+        if len(visible_uids) != len(set(visible_uids)):
+            raise ProvenanceError(
+                "cannot materialize raw data because visible super_uids are not unique."
+            )
+        expected_uids = set(raw_nodes)
+        actual_uids = set(visible_uids)
+        if actual_uids != expected_uids:
+            raise ProvenanceError(
+                "cannot materialize raw data from an incomplete provenance partition; "
+                f"missing={expected_uids - actual_uids!r}, "
+                f"extra={actual_uids - expected_uids!r}."
+            )
         out = nx.DiGraph()
-        copy_graph_provenance(graph, out)
-        node_uid: dict[Hashable, Any] = {}
+        out.graph.update(dict(provenance[GRAPH_ATTRS_KEY]))
+        uid_for_node: dict[Hashable, Any] = {}
+        materialized_uids: set[Any] = set()
 
         for node, data in graph.nodes(data=True):
-            type_token = data[self.type_attr]
-            if not is_base_token(type_token):
-                raise ValidationError(
-                    f"complete decode for model {self.model_id!r} stopped at non-base "
-                    f"terminal type {type_token!r}. This decoder should have output_raw=False."
+            exact = data["type"]
+            if not is_base_type(exact):
+                raise ExactTypeError(
+                    f"final raw materialization encountered non-base type {exact!r}."
                 )
-            uids = normalize_super_uids(data[self.super_uid_attr])
+            uids = normalize_super_uids(data["super_uids"])
             if len(uids) != 1:
-                raise ValidationError(
-                    f"base terminal node {node!r} stores {len(uids)} UIDs rather than one."
+                raise ProvenanceError(
+                    f"base occurrence {node!r} contains {len(uids)} UIDs rather than one."
                 )
             uid = uids[0]
-            attrs = dict(provenance.get(uid, {}))
-            attrs.setdefault(self.uid_attr, uid)
-            attrs.setdefault(self.label_attr, raw_label_from_base_token(type_token))
-            attrs.setdefault(self.time_attr, data[self.time_attr])
-            out.add_node(uid, **attrs)
-            node_uid[node] = uid
+            if uid not in raw_nodes:
+                raise ProvenanceError(f"missing raw provenance for UID {uid!r}.")
+            if uid in materialized_uids:
+                raise ProvenanceError(f"UID {uid!r} occurs in more than one final base occurrence.")
+            provenance_label = raw_nodes[uid].get("label")
+            exact_label = exact_type_label(exact)
+            if provenance_label != exact_label:
+                raise ProvenanceError(
+                    f"final base occurrence for UID {uid!r} has exact label "
+                    f"{exact_label!r}, but provenance records {provenance_label!r}."
+                )
+            materialized_uids.add(uid)
+            out.add_node(uid, **dict(raw_nodes[uid]))
+            uid_for_node[node] = uid
+
+        expected_uids = set(raw_nodes)
+        if materialized_uids != expected_uids:
+            missing = expected_uids - materialized_uids
+            extra = materialized_uids - expected_uids
+            raise ProvenanceError(
+                f"final provenance partition mismatch; missing={missing!r}, extra={extra!r}."
+            )
 
         for parent, child, edge_data in graph.edges(data=True):
-            attach = normalize_attach_map(edge_data[self.attach_attr])
+            attach = normalize_attach_map(edge_data["attach_map"])
             if attach != (0,):
-                raise ValidationError(
-                    f"raw materialization encountered non-atomic attachment map {attach!r}."
+                raise ExactTypeError(
+                    f"raw materialization encountered non-atomic attachment {attach!r}."
                 )
-            out.add_edge(node_uid[parent], node_uid[child])
-
-        if validate:
-            validate_raw_tree(
-                out,
-                label_attr=self.label_attr,
-                time_attr=self.time_attr,
-                uid_attr=self.uid_attr,
-                require_uid=True,
-            )
+            out.add_edge(uid_for_node[parent], uid_for_node[child])
+        validate_raw_tree(out)
         return out

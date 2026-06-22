@@ -1,14 +1,14 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "tree-coarsening"
-version = "0.6.1"
+version = "0.15.0"
 description = "BPE-like coarsening of labeled directed trees represented as NetworkX graphs"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
   {name = "Tree Coarsening Contributors"}
 ]
@@ -25,7 +25,12 @@ dev = [
   "pytest>=7.0",
   "nbformat>=5.0",
   "nbclient>=0.8",
-  "ipykernel>=6.0"
+  "ipykernel>=6.0",
+  "matplotlib>=3.8",
+  "pandas>=2.0",
+  "ruff>=0.15",
+  "build>=1.2",
+  "wheel>=0.45"
 ]
 
 [tool.setuptools.packages.find]
@@ -37,6 +42,11 @@ tree_coarsening = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = [
+  "audit",
+  "tree_coarsening/coarseners/edge_bpe_numba.py",
+]

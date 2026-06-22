@@ -1,112 +1,110 @@
-"""Flat original-UID provenance utilities for encoded tree nodes."""
+"""Raw-node and graph provenance helpers for schema 1.0."""
 
 from __future__ import annotations
 
-from collections.abc import Hashable as HashableABC, Mapping, Sequence
+from collections.abc import Hashable as HashableABC, Mapping
 from typing import Any
 
 import networkx as nx
 
-from .exceptions import ValidationError
-from .vocabulary import Token, VocabEntry, Vocabulary, is_base_token
+from .exceptions import ProvenanceError
 
 PROVENANCE_KEY = "tree_coarsening_provenance"
 NODE_ATTRS_KEY = "node_attrs_by_uid"
+GRAPH_ATTRS_KEY = "graph_attrs"
+RESERVED_PREFIX = "tree_coarsening_"
 
 
-def is_sequence_like(x: Any) -> bool:
-    """Return True for non-string sequences used as provenance containers."""
-
-    return isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray))
-
-
-def require_hashable_uid(uid: Any) -> Any:
+def require_uid(uid: Any, *, context: str = "uid") -> Any:
     if not isinstance(uid, HashableABC):
-        raise ValidationError(f"UIDs used in super_uids must be hashable; got {uid!r}.")
+        raise ProvenanceError(f"{context} must be hashable; got {uid!r}.")
+    try:
+        hash(uid)
+    except Exception as exc:
+        raise ProvenanceError(f"{context} cannot be hashed reliably: {uid!r}.") from exc
     return uid
 
 
 def normalize_super_uids(value: Any) -> tuple[Any, ...]:
-    """Normalize a stored ``super_uids`` value to a flat tuple of UIDs."""
-
-    if not is_sequence_like(value):
-        raise ValidationError(f"super_uids must be a sequence of UIDs; got {value!r}.")
-    out = tuple(value)
-    for uid in out:
-        require_hashable_uid(uid)
-    return out
+    if not isinstance(value, tuple):
+        raise ProvenanceError(f"super_uids must be a tuple; got {type(value).__name__}.")
+    if not value:
+        raise ProvenanceError("super_uids must not be empty.")
+    for i, uid in enumerate(value):
+        require_uid(uid, context=f"super_uids[{i}]")
+    return value
 
 
 def split_super_uids(
-    token: Token,
-    super_uids: Any,
-    vocab: Mapping[Token, VocabEntry] | Vocabulary,
+    super_uids: tuple[Any, ...],
+    component_sizes: tuple[int, ...],
 ) -> tuple[tuple[Any, ...], ...]:
-    """Split flat occurrence provenance into recipe-position slices."""
-
-    vocabulary = vocab if isinstance(vocab, Vocabulary) else Vocabulary(entries=dict(vocab))
-    uids = normalize_super_uids(super_uids)
-    if is_base_token(token):
-        if len(uids) != 1:
-            raise ValidationError(f"base token {token!r} expects one UID, got {len(uids)}.")
-        return (uids,)
-    if token not in vocabulary.entries:
-        raise ValidationError(f"unknown token {token!r}.")
-    entry = vocabulary.entries[token]
-    expected = vocabulary.site_count(token)
-    if len(uids) != expected:
-        raise ValidationError(
-            f"token {token!r} expects {expected} super_uids, got {len(uids)}."
-        )
+    flat = normalize_super_uids(super_uids)
     pieces: list[tuple[Any, ...]] = []
-    pos = 0
-    for child_token in entry.label:
-        k = vocabulary.site_count(child_token)
-        pieces.append(tuple(uids[pos : pos + k]))
-        pos += k
+    cursor = 0
+    for i, size in enumerate(component_sizes):
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise ProvenanceError(f"component_sizes[{i}] must be positive; got {size!r}.")
+        pieces.append(tuple(flat[cursor : cursor + size]))
+        cursor += size
+    if cursor != len(flat):
+        raise ProvenanceError(
+            f"component sizes total {cursor}, but super_uids contains {len(flat)} values."
+        )
     return tuple(pieces)
 
 
-def validate_super_uids(
-    token: Token,
-    super_uids: Any,
-    vocab: Mapping[Token, VocabEntry] | Vocabulary,
-) -> None:
-    vocabulary = vocab if isinstance(vocab, Vocabulary) else Vocabulary(entries=dict(vocab))
-    uids = normalize_super_uids(super_uids)
-    expected = vocabulary.site_count(token)
-    if len(uids) != expected:
-        raise ValidationError(
-            f"token {token!r} expects {expected} super_uids, got {len(uids)}."
+def snapshot_raw_provenance(graph: nx.DiGraph) -> dict[str, Any]:
+    node_attrs: dict[Any, dict[str, Any]] = {}
+    for node, data in graph.nodes(data=True):
+        uid = require_uid(data["uid"], context=f"uid on node {node!r}")
+        if uid in node_attrs:
+            raise ProvenanceError(f"duplicate raw UID {uid!r}.")
+        node_attrs[uid] = dict(data)
+    graph_attrs = {
+        key: value
+        for key, value in graph.graph.items()
+        if not (isinstance(key, str) and key.startswith(RESERVED_PREFIX))
+    }
+    return {NODE_ATTRS_KEY: node_attrs, GRAPH_ATTRS_KEY: graph_attrs}
+
+
+def normalize_provenance(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ProvenanceError("tree_coarsening_provenance must be a mapping.")
+    if set(value) != {NODE_ATTRS_KEY, GRAPH_ATTRS_KEY}:
+        raise ProvenanceError(
+            "provenance must contain exactly 'node_attrs_by_uid' and 'graph_attrs'."
         )
+    raw_nodes = value[NODE_ATTRS_KEY]
+    raw_graph = value[GRAPH_ATTRS_KEY]
+    if not isinstance(raw_nodes, Mapping):
+        raise ProvenanceError("node_attrs_by_uid must be a mapping.")
+    if not isinstance(raw_graph, Mapping):
+        raise ProvenanceError("graph_attrs must be a mapping.")
+
+    nodes: dict[Any, dict[str, Any]] = {}
+    for uid, attrs in raw_nodes.items():
+        require_uid(uid, context="provenance UID")
+        if not isinstance(attrs, Mapping):
+            raise ProvenanceError(f"provenance attributes for UID {uid!r} must be a mapping.")
+        attrs_copy = dict(attrs)
+        if "uid" not in attrs_copy or attrs_copy["uid"] != uid:
+            raise ProvenanceError(
+                f"provenance attributes for UID {uid!r} do not store the same 'uid'."
+            )
+        nodes[uid] = attrs_copy
+
+    graph_attrs = dict(raw_graph)
+    bad = [key for key in graph_attrs if isinstance(key, str) and key.startswith(RESERVED_PREFIX)]
+    if bad:
+        raise ProvenanceError(f"provenance graph_attrs contains reserved keys: {bad!r}.")
+    return {NODE_ATTRS_KEY: nodes, GRAPH_ATTRS_KEY: graph_attrs}
 
 
-def provenance_from_raw_graph(
-    G: nx.DiGraph,
-    *,
-    uid_attr: str = "uid",
-) -> dict[str, Any]:
-    """Build a graph-level provenance table from a raw tree."""
-
-    table: dict[Any, dict[str, Any]] = {}
-    for node, data in G.nodes(data=True):
-        uid = data[uid_attr]
-        if uid in table:
-            raise ValidationError(f"duplicate UID in provenance table: {uid!r}.")
-        table[uid] = dict(data)
-    return {NODE_ATTRS_KEY: table, "uid_attr": uid_attr}
+def get_node_attrs_by_uid(graph: nx.DiGraph) -> dict[Any, dict[str, Any]]:
+    return normalize_provenance(graph.graph[PROVENANCE_KEY])[NODE_ATTRS_KEY]
 
 
-def get_node_attrs_by_uid(H: nx.DiGraph) -> dict[Any, dict[str, Any]]:
-    """Return graph-level raw-node provenance, or an empty table."""
-
-    prov = H.graph.get(PROVENANCE_KEY, {})
-    table = prov.get(NODE_ATTRS_KEY, {}) if isinstance(prov, dict) else {}
-    return dict(table)
-
-
-def copy_graph_provenance(src: nx.DiGraph, dst: nx.DiGraph) -> None:
-    """Copy graph-level tree-coarsening provenance metadata."""
-
-    for key, value in src.graph.items():
-        dst.graph[key] = value
+def copy_graph_provenance(source: nx.DiGraph, target: nx.DiGraph) -> None:
+    target.graph[PROVENANCE_KEY] = normalize_provenance(source.graph[PROVENANCE_KEY])

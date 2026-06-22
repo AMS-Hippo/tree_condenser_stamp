@@ -1,0 +1,43 @@
+{
+  "environment": {
+    "networkx": "3.6.1",
+    "platform": "Linux-4.4.0-x86_64-with-glibc2.41",
+    "python": "3.13.5"
+  },
+  "repetitions": 3,
+  "rows": [
+    {
+      "nodes": 101,
+      "one_batch_per_rule_seconds": 0.03359565499999917,
+      "rules": 25,
+      "speedup": 6.830506506760642,
+      "wave_seconds": 0.0049184720000994275,
+      "waves": 1
+    },
+    {
+      "nodes": 201,
+      "one_batch_per_rule_seconds": 0.11463009600015539,
+      "rules": 50,
+      "speedup": 13.176480433180554,
+      "wave_seconds": 0.008699599000010494,
+      "waves": 1
+    },
+    {
+      "nodes": 401,
+      "one_batch_per_rule_seconds": 0.45106363300010344,
+      "rules": 100,
+      "speedup": 21.22915032634249,
+      "wave_seconds": 0.021247371000072235,
+      "waves": 1
+    },
+    {
+      "nodes": 801,
+      "one_batch_per_rule_seconds": 1.883906677000141,
+      "rules": 200,
+      "speedup": 41.1168491138204,
+      "wave_seconds": 0.04581836200009093,
+      "waves": 1
+    }
+  ],
+  "validation": "full"
+}

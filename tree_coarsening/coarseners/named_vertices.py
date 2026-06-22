@@ -1,551 +1,200 @@
-"""Deterministic contraction of connected components selected by UID or label."""
+"""A deliberately small schema-1 coarsener for configured vertices."""
 
 from __future__ import annotations
 
-from collections.abc import Collection, Hashable as HashableABC, Sequence
-from dataclasses import dataclass
-from hashlib import sha256
+from collections.abc import Collection, Hashable as HashableABC, Iterable, Sequence
 from typing import Any, Hashable, Literal
 
 import networkx as nx
 
 from ..coarsener import TreeCoarsener
+from ..contraction import RuleBasedEncoder
 from ..decoder import TreeDecoder
 from ..encoder import EncodingRule, TreeEncoder
-from ..exceptions import ValidationError
-from ..nx_io import edge_attach_attrs, relabel_to_consecutive_topological
-from ..provenance import (
-    PROVENANCE_KEY,
-    copy_graph_provenance,
-    get_node_attrs_by_uid,
-    provenance_from_raw_graph,
-)
-from ..schema import (
-    RAW_INPUT_FLAG,
-    encoded_node_attrs,
-    max_component_time,
-    normalize_coarsenable_tree,
-)
+from ..exceptions import ConfigurationError, ProvenanceError
 from ..stage_decoder import StructuralStageDecoder
-from ..structural import CompositeType, infer_input_alphabet, structural_root_count
-from ..validation import (
-    deterministic_node_order,
-    validate_coarsenable_tree,
-    validate_encoded_tree,
-)
-from ..vocabulary import Token, TokenSpec, VocabEntry, Vocabulary, normalize_attach_map
+from ..validation import deterministic_node_order
 
 SelectorKind = Literal["uid", "label"]
 ComponentPolicy = Literal["all", "largest"]
 
 
-def named_component_token(
-    selector: SelectorKind,
-    parent: tuple[int, ...],
-    label: tuple[Token, ...],
-    attach: tuple[int, ...],
-) -> tuple[str, str, int, str]:
-    """Return a stable token id for one canonical connected-component recipe.
-
-    The digest keeps encoded node labels compact; the complete, collision-checked
-    recipe remains authoritative in the vocabulary.
-    """
-
-    hasher = sha256()
-    for values in (parent, label, attach):
-        hasher.update(len(values).to_bytes(8, "big"))
-        for value in values:
-            item = repr(value).encode("utf-8")
-            hasher.update(len(item).to_bytes(8, "big"))
-            hasher.update(item)
-    return ("named_component", selector, len(parent), hasher.hexdigest()[:20])
+def named_component_label(model_id: str) -> tuple[str, str]:
+    return ("named_component", model_id)
 
 
-@dataclass
-class NamedVertexEncoder(TreeEncoder):
-    """Contract maximal connected components selected by raw UID or raw label.
+class NamedVertexEncoder(RuleBasedEncoder):
+    """Select configured occurrences; shared machinery performs all rewiring."""
 
-    Vocabulary entries are registered lazily during ``encode`` because this
-    coarsener learns no graph patterns during ``fit``. The matching decoder must
-    share this encoder's mutable ``Vocabulary`` object.
-    """
-
-    selector: SelectorKind = "uid"
-    selected_values: frozenset[Hashable] = frozenset()
-    component_policy: ComponentPolicy = "all"
-
-    def encode(self, G: nx.DiGraph, *, validate: bool = True) -> nx.DiGraph:
-        G = normalize_coarsenable_tree(
-            G,
-            label_attr=self.label_attr,
-            type_attr=self.type_attr,
-            size_attr=self.size_attr,
-            time_attr=self.time_attr,
-            uid_attr=self.uid_attr,
-            super_label_attr=self.super_label_attr,
-            super_uid_attr=self.super_uid_attr,
-            attach_attr=self.attach_attr,
-            copy=True,
-        )
-        if validate:
-            validate_coarsenable_tree(
-                G,
-                label_attr=self.label_attr,
-                type_attr=self.type_attr,
-                size_attr=self.size_attr,
-                time_attr=self.time_attr,
-                super_label_attr=self.super_label_attr,
-                super_uid_attr=self.super_uid_attr,
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        rules: Sequence[EncodingRule],
+        selector: SelectorKind,
+        selected_values: frozenset[Hashable],
+        component_policy: ComponentPolicy,
+    ) -> None:
+        super().__init__(model_id=model_id, rules=rules)
+        if selector not in {"uid", "label"}:
+            raise ConfigurationError("selector must be 'uid' or 'label'.")
+        selected_values = frozenset(selected_values)
+        if not selected_values:
+            raise ConfigurationError("selected_values must not be empty.")
+        if component_policy not in {"all", "largest"}:
+            raise ConfigurationError("component_policy must be 'all' or 'largest'.")
+        if len(self.rules) != 1:
+            raise ConfigurationError("NamedVertexEncoder requires exactly one rule.")
+        rule = self.rules[0]
+        required_pattern_keys = {"selector", "values", "component_policy"}
+        if set(rule.pattern) != required_pattern_keys:
+            raise ConfigurationError(
+                "named-component rule must contain exactly selector, values, and "
+                "component_policy pattern keys."
             )
-
-        selected = self._selected_nodes(G)
-        components = self._selected_components(G, selected)
-        components = [component for component in components if len(component) >= 2]
-        if self.component_policy == "largest" and components:
-            components = [max(components, key=len)]
-
-        component_for_node: dict[Hashable, tuple[Hashable, int]] = {}
-        component_info: dict[
-            Hashable,
-            tuple[
-                Token,
-                tuple[Hashable, ...],
-                tuple[int, ...],
-                tuple[int, ...],
-            ],
-        ] = {}
-
-        for serial, component in enumerate(components):
-            for node in component:
-                self.vocab.add_symbol(
-                    G.nodes[node][self.label_attr],
-                    TokenSpec(
-                        site_count=G.nodes[node][self.size_attr],
-                        root_count=structural_root_count(
-                            G.nodes[node][self.type_attr], self.vocab
-                        ),
-                    ),
-                )
-            parent, labels, attach = self._component_recipe(G, component)
-            token = self._register_recipe(parent, labels, attach)
-            coarse_node = ("__tc_named_component__", self.model_id, serial)
-            component_info[coarse_node] = (token, component, parent, attach)
-            for position, node in enumerate(component):
-                if node in component_for_node:
-                    raise ValidationError(
-                        f"node {node!r} belongs to more than one selected component."
-                    )
-                component_for_node[node] = (coarse_node, position)
-
-        H = nx.DiGraph()
-        if get_node_attrs_by_uid(G):
-            copy_graph_provenance(G, H)
-        else:
-            H.graph[PROVENANCE_KEY] = provenance_from_raw_graph(G, uid_attr=self.uid_attr)
-        H.graph[RAW_INPUT_FLAG] = False
-        H.graph["tree_coarsening_schema"] = {
-            "schema_version": "0.3",
-            "model_id": self.model_id,
-            "node_label_semantics": "fit symbol",
-            "node_type_semantics": "exact structural variant",
-        }
-
-        owner: dict[Hashable, Hashable] = {}
-        site_offset: dict[Hashable, int] = {}
-        root_offset: dict[Hashable, int] = {}
-
-        for coarse_node, (_token, component, parent_recipe, _attach) in component_info.items():
-            site_cursor = 0
-            root_cursor = 0
-            for position, node in enumerate(component):
-                owner[node] = coarse_node
-                site_offset[node] = site_cursor
-                site_cursor += G.nodes[node][self.size_attr]
-                if parent_recipe[position] == -1:
-                    root_offset[node] = root_cursor
-                    root_cursor += structural_root_count(
-                        G.nodes[node][self.type_attr], self.vocab
-                    )
-                else:
-                    root_offset[node] = 0
-
-        for node, data in G.nodes(data=True):
-            if node in component_for_node:
-                continue
-            owner[node] = node
-            site_offset[node] = 0
-            root_offset[node] = 0
-            H.add_node(
-                node,
-                **encoded_node_attrs(
-                    label=data[self.label_attr],
-                    type_token=data[self.type_attr],
-                    size=data[self.size_attr],
-                    time=data[self.time_attr],
-                    super_label=data[self.super_label_attr],
-                    super_uids=data[self.super_uid_attr],
-                    label_attr=self.label_attr,
-                    type_attr=self.type_attr,
-                    size_attr=self.size_attr,
-                    time_attr=self.time_attr,
-                    super_label_attr=self.super_label_attr,
-                    super_uid_attr=self.super_uid_attr,
-                ),
+        expected_values = tuple(sorted(selected_values, key=repr))
+        try:
+            pattern_values = tuple(rule.pattern["values"])
+        except TypeError as exc:
+            raise ConfigurationError(
+                "named-component rule pattern values must be an iterable collection."
+            ) from exc
+        if rule.operation != "component":
+            raise ConfigurationError("named-component rule must use operation='component'.")
+        if rule.output_label != named_component_label(model_id):
+            raise ConfigurationError("named-component output label disagrees with model_id.")
+        if rule.parameter_names != ("topology",):
+            raise ConfigurationError("named-component rule must omit only 'topology'.")
+        if (
+            rule.pattern["selector"] != selector
+            or pattern_values != expected_values
+            or rule.pattern["component_policy"] != component_policy
+        ):
+            raise ConfigurationError(
+                "named-component rule pattern disagrees with encoder selection state."
             )
+        self.selector = selector
+        self.selected_values = selected_values
+        self.component_policy = component_policy
 
-        for coarse_node, (token, component, parent_recipe, attach) in component_info.items():
-            component_labels = tuple(G.nodes[node][self.label_attr] for node in component)
-            component_types = tuple(G.nodes[node][self.type_attr] for node in component)
-            component_sizes = tuple(G.nodes[node][self.size_attr] for node in component)
-            component_roots = tuple(
-                structural_root_count(G.nodes[node][self.type_attr], self.vocab)
-                for node in component
-            )
-            exact_type = CompositeType(
-                model_id=self.model_id,
-                kind="component",
-                label=token,
-                parent=parent_recipe,
-                component_labels=component_labels,
-                component_types=component_types,
-                component_sizes=component_sizes,
-                component_root_counts=component_roots,
-                attach=attach,
-            )
-            uids = tuple(
-                uid
-                for node in component
-                for uid in G.nodes[node][self.super_uid_attr]
-            )
-            H.add_node(
-                coarse_node,
-                **encoded_node_attrs(
-                    label=token,
-                    type_token=exact_type,
-                    size=sum(component_sizes),
-                    time=max_component_time(
-                        *(G.nodes[node][self.time_attr] for node in component)
-                    ),
-                    super_label=tuple(
-                        G.nodes[node][self.super_label_attr] for node in component
-                    ),
-                    super_uids=uids,
-                    label_attr=self.label_attr,
-                    type_attr=self.type_attr,
-                    size_attr=self.size_attr,
-                    time_attr=self.time_attr,
-                    super_label_attr=self.super_label_attr,
-                    super_uid_attr=self.super_uid_attr,
-                ),
-            )
-
-        edge_maps: dict[tuple[Hashable, Hashable], list[int | None]] = {}
-        for parent, child, edge_data in G.edges(data=True):
-            coarse_parent = owner[parent]
-            coarse_child = owner[child]
-            if coarse_parent == coarse_child:
-                continue
-            incoming = normalize_attach_map(edge_data[self.attach_attr])
-            child_roots = structural_root_count(G.nodes[child][self.type_attr], self.vocab)
-            if len(incoming) != child_roots:
-                raise ValidationError(
-                    f"edge {(parent, child)!r} carries {len(incoming)} roots; "
-                    f"child type expects {child_roots}."
-                )
-            coarse_child_roots = structural_root_count(
-                H.nodes[coarse_child][self.type_attr], self.vocab
-            )
-            slots = edge_maps.setdefault(
-                (coarse_parent, coarse_child), [None] * coarse_child_roots
-            )
-            root_start = root_offset[child]
-            parent_start = site_offset[parent]
-            for local_root, parent_site in enumerate(incoming):
-                root_index = root_start + local_root
-                translated_site = parent_start + parent_site
-                old = slots[root_index]
-                if old is not None and old != translated_site:
-                    raise ValidationError(
-                        f"conflicting projected attachment for coarse edge "
-                        f"{(coarse_parent, coarse_child)!r}, root {root_index}."
-                    )
-                slots[root_index] = translated_site
-
-        for (parent, child), slots in edge_maps.items():
-            if any(site is None for site in slots):
-                raise ValidationError(
-                    f"incomplete attach_map for coarse edge {(parent, child)!r}: {slots!r}."
-                )
-            H.add_edge(
-                parent,
-                child,
-                **edge_attach_attrs(
-                    tuple(int(site) for site in slots if site is not None),
-                    attach_attr=self.attach_attr,
-                ),
-            )
-
-        H = relabel_to_consecutive_topological(H)
-        if validate:
-            validate_encoded_tree(
-                H,
-                vocab=self.vocab,
-                label_attr=self.label_attr,
-                type_attr=self.type_attr,
-                size_attr=self.size_attr,
-                time_attr=self.time_attr,
-                super_label_attr=self.super_label_attr,
-                super_uid_attr=self.super_uid_attr,
-                attach_attr=self.attach_attr,
-            )
-        return H
-
-    def _selected_nodes(self, G: nx.DiGraph) -> set[Hashable]:
-        if self.selector == "uid":
-            return {
+    def select_contractions(
+        self,
+        graph: nx.DiGraph,
+        rule: EncodingRule,
+    ) -> Sequence[Iterable[Hashable]]:
+        del rule
+        selected: set[Hashable] = set()
+        if self.selector == "label":
+            selected = {
                 node
-                for node, data in G.nodes(data=True)
-                if any(uid in self.selected_values for uid in data[self.super_uid_attr])
+                for node, data in graph.nodes(data=True)
+                if data["label"] in self.selected_values
             }
-        return {
-            node
-            for node, data in G.nodes(data=True)
-            if data[self.label_attr] in self.selected_values
-        }
-
-    def _selected_components(
-        self,
-        G: nx.DiGraph,
-        selected: set[Hashable],
-    ) -> list[tuple[Hashable, ...]]:
-        """Return maximal selected components in deterministic rooted preorder."""
-
-        roots: list[Hashable] = []
-        for node in selected:
-            parent = next(iter(G.predecessors(node)), None)
-            if parent not in selected:
-                roots.append(node)
-        roots = deterministic_node_order(
-            G,
-            roots,
-            label_attr=self.label_attr,
-            time_attr=self.time_attr,
-            uid_attr=self.uid_attr,
-        )
-
-        components: list[tuple[Hashable, ...]] = []
-        seen: set[Hashable] = set()
-        for root in roots:
-            if root in seen:
-                continue
-            order: list[Hashable] = []
-            stack = [root]
-            while stack:
-                node = stack.pop()
-                if node in seen:
-                    continue
-                seen.add(node)
-                order.append(node)
-                children = [child for child in G.successors(node) if child in selected]
-                children = deterministic_node_order(
-                    G,
-                    children,
-                    label_attr=self.label_attr,
-                    time_attr=self.time_attr,
-                    uid_attr=self.uid_attr,
-                )
-                stack.extend(reversed(children))
-            components.append(tuple(order))
-
-        if seen != selected:
-            missing = selected - seen
-            raise ValidationError(f"failed to enumerate selected nodes {missing!r}.")
-        return components
-
-    def _component_recipe(
-        self,
-        G: nx.DiGraph,
-        component: Sequence[Hashable],
-    ) -> tuple[tuple[int, ...], tuple[Token, ...], tuple[int, ...]]:
-        index = {node: i for i, node in enumerate(component)}
-        parent: list[int] = []
-        labels: list[Token] = []
-
-        for node in component:
-            raw_parent = next(iter(G.predecessors(node)), None)
-            parent.append(index[raw_parent] if raw_parent in index else -1)
-            labels.append(G.nodes[node][self.label_attr])
-
-        parent_tuple = tuple(parent)
-        if parent_tuple.count(-1) != 1:
-            raise ValidationError(
-                "a connected selected component must have exactly one exposed root."
-            )
-        if any(p >= i for i, p in enumerate(parent_tuple) if p >= 0):
-            raise ValidationError("component canonical order must place parents before children.")
-
-        attach_values: list[int] = []
-        for position, parent_i in enumerate(parent_tuple):
-            if parent_i == -1:
-                continue
-            parent_node = component[parent_i]
-            child_node = component[position]
-            attach_values.extend(
-                normalize_attach_map(G.edges[parent_node, child_node][self.attach_attr])
-            )
-        attach = tuple(attach_values)
-        return parent_tuple, tuple(labels), attach
-
-    def _register_recipe(
-        self,
-        parent: tuple[int, ...],
-        label: tuple[Token, ...],
-        attach: tuple[int, ...],
-    ) -> Token:
-        token = named_component_token(self.selector, parent, label, attach)
-        existing = self.vocab.entries.get(token)
-        if existing is not None:
-            if (
-                existing.parent != parent
-                or existing.label != label
-                or existing.attach != attach
-            ):
-                raise ValidationError(
-                    f"named-component token digest collision for token {token!r}."
-                )
-            return token
-
-        step = len(self.vocab.creation_order)
-        entry = VocabEntry(
-            token=token,
-            parent=parent,
-            label=label,
-            attach=attach,
-            created_at_step=step,
-            operation="component",
-            metadata={
-                "coarsener": "NamedVertexCoarsener",
-                "selector": self.selector,
-                "component_size": len(parent),
-                "component_policy": self.component_policy,
-            },
-        )
-        self.vocab.add(entry)
-
-        dynamic_rule = EncodingRule(
-            token=token,
-            operation="component",
-            created_at_step=step,
-            pattern={
-                "selector": self.selector,
-                "component_size": len(parent),
-            },
-        )
-        if isinstance(self.rules, list):
-            self.rules.append(dynamic_rule)
         else:
-            self.rules = tuple(self.rules) + (dynamic_rule,)
-        return token
+            for node, data in graph.nodes(data=True):
+                uids = set(data["super_uids"])
+                overlap = uids & self.selected_values
+                if overlap and overlap != uids:
+                    raise ProvenanceError(
+                        f"UID selection partially overlaps occurrence {node!r}: "
+                        f"selected {overlap!r} of {uids!r}."
+                    )
+                if uids and uids <= self.selected_values:
+                    selected.add(node)
+
+        if not selected:
+            return ()
+        order = deterministic_node_order(graph)
+        position = {node: i for i, node in enumerate(order)}
+        components = [
+            tuple(sorted(component, key=position.__getitem__))
+            for component in nx.connected_components(
+                graph.subgraph(selected).to_undirected(as_view=True)
+            )
+            if len(component) >= 2
+        ]
+        components.sort(key=lambda component: position[component[0]])
+        if self.component_policy == "largest" and components:
+            # Size is primary. Equal-size components are resolved by occurrence
+            # semantics rather than current NetworkX keys, so relabeling an
+            # otherwise identical input cannot change the selected component.
+            def semantic_key(component: tuple[Hashable, ...]) -> tuple[Any, ...]:
+                return tuple(
+                    (
+                        repr(graph.nodes[node]["label"]),
+                        repr(graph.nodes[node]["type"]),
+                        repr(graph.nodes[node]["super_uids"]),
+                        repr(graph.nodes[node]["time"]),
+                    )
+                    for node in component
+                )
+
+            components = [max(components, key=lambda item: (len(item), semantic_key(item)))]
+        return tuple(components)
 
 
 class NamedVertexCoarsener(TreeCoarsener):
-    """Contract connected components induced by explicitly named UIDs or labels.
-
-    Exactly one of ``uids`` and ``labels`` must be supplied. ``component_policy``
-    determines whether every maximal matching component or only the largest one
-    is contracted. Components of size one are left as base-token occurrences.
-
-    ``fit`` performs no statistical learning. It only validates the supplied
-    graphs (when validation is enabled) and constructs an encoder/decoder pair.
-    Exact component recipes are added lazily to their shared vocabulary when
-    ``transform`` first encounters them.
-    """
+    """Contract configured maximal connected current-tree components."""
 
     def __init__(
         self,
         *,
         uids: Collection[Hashable] | None = None,
-        labels: Collection[Hashable] | str | None = None,
+        labels: Collection[Hashable] | None = None,
         component_policy: ComponentPolicy = "all",
-        **kwargs: Any,
+        fitting_size: int = 1,
+        model_id: str | None = None,
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__(model_id=model_id)
         if (uids is None) == (labels is None):
-            raise ValueError("supply exactly one of uids=... or labels=....")
+            raise ConfigurationError("exactly one of uids= and labels= must be supplied.")
+        values: Any = uids if uids is not None else labels
+        if isinstance(values, (str, bytes, bytearray)) or not isinstance(values, Collection):
+            raise ConfigurationError("uids= and labels= must be explicit nonempty collections.")
+        if not values:
+            raise ConfigurationError("uids= and labels= must not be empty.")
+        for value in values:
+            if not isinstance(value, HashableABC):
+                raise ConfigurationError(f"selection value must be hashable: {value!r}.")
+            try:
+                hash(value)
+            except Exception as exc:
+                raise ConfigurationError(
+                    f"selection value cannot be hashed reliably: {value!r}."
+                ) from exc
         if component_policy not in {"all", "largest"}:
-            raise ValueError("component_policy must be 'all' or 'largest'.")
+            raise ConfigurationError("component_policy must be 'all' or 'largest'.")
+        if not isinstance(fitting_size, int) or isinstance(fitting_size, bool) or fitting_size <= 0:
+            raise ConfigurationError("fitting_size must be a positive integer.")
 
-        if uids is not None:
-            values = tuple(uids)
-            if not values:
-                raise ValueError("uids must be nonempty.")
-            if not all(isinstance(uid, HashableABC) for uid in values):
-                raise TypeError("every selected UID must be hashable.")
-            self.selector: SelectorKind = "uid"
-            self.selected_values: frozenset[Hashable] = frozenset(values)
-        else:
-            label_values = (labels,) if isinstance(labels, str) else tuple(labels or ())
-            if not label_values:
-                raise ValueError("labels must be nonempty.")
-            if not all(isinstance(label, HashableABC) for label in label_values):
-                raise TypeError("every selected label must be hashable.")
-            self.selector = "label"
-            self.selected_values = frozenset(label_values)
-
+        self.selector: SelectorKind = "uid" if uids is not None else "label"
+        self.selected_values = frozenset(values)
         self.component_policy = component_policy
+        self.fitting_size = fitting_size
 
-    def _fit(self, graphs: Sequence[nx.DiGraph]) -> tuple[TreeEncoder, TreeDecoder]:
-        if self.validate_inputs:
-            for G in graphs:
-                validate_coarsenable_tree(
-                    G,
-                    label_attr=self.label_attr,
-                    type_attr=self.type_attr,
-                    size_attr=self.size_attr,
-                    time_attr=self.time_attr,
-                    super_label_attr=self.super_label_attr,
-                    super_uid_attr=self.super_uid_attr,
-                )
-
-        input_alphabet = infer_input_alphabet(
-            graphs,
-            label_attr=self.label_attr,
-            type_attr=self.type_attr,
-            size_attr=self.size_attr,
-            attach_attr=self.attach_attr,
+    def _fit(
+        self,
+        graphs: Sequence[nx.DiGraph],
+    ) -> tuple[TreeEncoder, TreeDecoder]:
+        del graphs
+        rule = EncodingRule(
+            rule_index=0,
+            operation="component",
+            output_label=named_component_label(self.model_id),
+            output_fitting_size=self.fitting_size,
+            pattern={
+                "selector": self.selector,
+                "values": tuple(sorted(self.selected_values, key=repr)),
+                "component_policy": self.component_policy,
+            },
+            parameter_names=("topology",),
         )
-        vocab = Vocabulary(symbols=input_alphabet)
-        dynamic_rules: list[EncodingRule] = []
         encoder = NamedVertexEncoder(
             model_id=self.model_id,
-            vocab=vocab,
-            rules=dynamic_rules,
-            base_labels=frozenset(),
-            label_attr=self.label_attr,
-            type_attr=self.type_attr,
-            size_attr=self.size_attr,
-            time_attr=self.time_attr,
-            uid_attr=self.uid_attr,
-            super_label_attr=self.super_label_attr,
-            super_uid_attr=self.super_uid_attr,
-            attach_attr=self.attach_attr,
+            rules=(rule,),
             selector=self.selector,
             selected_values=self.selected_values,
             component_policy=self.component_policy,
         )
-        output_raw = all(graph.graph.get(RAW_INPUT_FLAG, False) for graph in graphs)
-        decoder = StructuralStageDecoder(
-            model_id=self.model_id,
-            vocab=vocab,
-            base_labels=frozenset(),
-            label_attr=self.label_attr,
-            type_attr=self.type_attr,
-            size_attr=self.size_attr,
-            time_attr=self.time_attr,
-            uid_attr=self.uid_attr,
-            super_label_attr=self.super_label_attr,
-            super_uid_attr=self.super_uid_attr,
-            attach_attr=self.attach_attr,
-            output_raw=output_raw,
-        )
+        decoder = StructuralStageDecoder(model_id=self.model_id, rules=(rule,))
         return encoder, decoder

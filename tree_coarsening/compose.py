@@ -1,130 +1,182 @@
-"""Composition helpers for fitted encoder/decoder artifacts."""
+"""Lazy composition of fitted schema-1 encoder/decoder stages."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Literal
+from collections.abc import Hashable, Sequence
 from uuid import uuid4
 
-from .decoder import LazyTreeDecoder, TreeDecoder
-from .encoder import LazyTreeEncoder, TreeEncoder
-from .exceptions import ValidationError
-from .vocabulary import Token, TokenSpec, VocabEntry, Vocabulary
+import networkx as nx
+
+from .decoder import TreeDecoder
+from .encoder import EncodingRule, TreeEncoder
+from .exceptions import CompositionError, DecodeSelectionError
+
+
+def _inspection_rules(encoders: Sequence[TreeEncoder]) -> tuple[EncodingRule, ...]:
+    flattened: list[EncodingRule] = []
+    for encoder in encoders:
+        for rule in encoder.rules:
+            flattened.append(
+                EncodingRule(
+                    rule_index=len(flattened),
+                    operation=rule.operation,
+                    output_label=rule.output_label,
+                    output_fitting_size=rule.output_fitting_size,
+                    pattern=dict(rule.pattern),
+                    parameter_names=rule.parameter_names,
+                    score=rule.score,
+                )
+            )
+    return tuple(flattened)
+
+
+class CombinedTreeEncoder(TreeEncoder):
+    """Apply an immutable tuple of atomic stage encoders in order."""
+
+    def __init__(self, *, model_id: str, encoders: Sequence[TreeEncoder]) -> None:
+        self.encoders = tuple(encoders)
+        self.stage_model_ids = tuple(encoder.model_id for encoder in self.encoders)
+        super().__init__(model_id=model_id, rules=_inspection_rules(self.encoders))
+
+    def transform(
+        self,
+        graph: nx.DiGraph,
+        *,
+        validate: str | bool = "full",
+    ) -> nx.DiGraph:
+        current = graph
+        for encoder in self.encoders:
+            current = encoder.transform(current, validate=validate)
+        return current
+
+
+class CombinedTreeDecoder(TreeDecoder):
+    """Reverse an immutable tuple of atomic stage decoders in reverse order."""
+
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        decoders: Sequence[TreeDecoder],
+        inspection_rules: Sequence[EncodingRule],
+    ) -> None:
+        self.decoders = tuple(decoders)
+        self.stage_model_ids = tuple(decoder.model_id for decoder in self.decoders)
+        super().__init__(model_id=model_id, rules=inspection_rules)
+
+    def decode(
+        self,
+        graph: nx.DiGraph,
+        *,
+        target: Hashable | None = None,
+        by: str = "node",
+        recursive: bool = True,
+        boundary_policy: str = "expand",
+        validate: str | bool = "full",
+    ) -> nx.DiGraph:
+        if target is not None:
+            raise DecodeSelectionError(
+                "targeted decoding through a combined pipeline is deferred; "
+                "use the current component decoder directly."
+            )
+        current = graph
+        for decoder in reversed(self.decoders):
+            current = decoder.decode(
+                current,
+                target=None,
+                by=by,
+                recursive=recursive,
+                boundary_policy=boundary_policy,
+                validate=validate,
+            )
+        return current
+
+
+def _flatten_encoder(encoder: TreeEncoder) -> tuple[TreeEncoder, ...]:
+    if isinstance(encoder, CombinedTreeEncoder):
+        return encoder.encoders
+    return (encoder,)
+
+
+def _flatten_decoder(decoder: TreeDecoder) -> tuple[TreeDecoder, ...]:
+    if isinstance(decoder, CombinedTreeDecoder):
+        return decoder.decoders
+    return (decoder,)
+
+
+def _validate_pair(encoder: TreeEncoder, decoder: TreeDecoder, *, index: int) -> None:
+    if encoder.model_id != decoder.model_id:
+        raise CompositionError(
+            f"encoder/decoder stage {index} has model IDs "
+            f"{encoder.model_id!r} and {decoder.model_id!r}."
+        )
+    if encoder.rules != decoder.rules:
+        raise CompositionError(f"encoder/decoder stage {index} disagrees on fitted rules.")
+    if encoder.vocab != decoder.vocab:
+        raise CompositionError(f"encoder/decoder stage {index} disagrees on stage vocabulary.")
 
 
 def combine(
     encoders: Sequence[TreeEncoder],
     decoders: Sequence[TreeDecoder],
-    *,
-    mode: Literal["lazy", "materialized"] = "lazy",
-    validate: bool = True,
 ) -> tuple[TreeEncoder, TreeDecoder]:
-    """Return a combined encoder/decoder pair.
+    if isinstance(encoders, (str, bytes, bytearray)) or isinstance(
+        decoders, (str, bytes, bytearray)
+    ):
+        raise CompositionError("encoders and decoders must be nonempty sequences.")
+    try:
+        encoder_inputs = tuple(encoders)
+        decoder_inputs = tuple(decoders)
+    except TypeError as exc:
+        raise CompositionError("encoders and decoders must be nonempty sequences.") from exc
+    if not encoder_inputs or not decoder_inputs:
+        raise CompositionError("encoders and decoders must be nonempty sequences.")
+    if len(encoder_inputs) != len(decoder_inputs):
+        raise CompositionError("encoders and decoders must have equal lengths.")
+    if any(not isinstance(encoder, TreeEncoder) for encoder in encoder_inputs):
+        raise CompositionError("every encoder must be a fitted TreeEncoder artifact.")
+    if any(not isinstance(decoder, TreeDecoder) for decoder in decoder_inputs):
+        raise CompositionError("every decoder must be a fitted TreeDecoder artifact.")
 
-    Encoders and decoders are supplied in encoder application order. Lazy
-    composition applies encoders in the supplied order and decoders in reverse
-    order. Materialized recipe substitution is reserved for a later pass.
-    """
-
-    encoders = tuple(encoders)
-    decoders = tuple(decoders)
-    if mode != "lazy":
-        raise NotImplementedError("materialized composition is not implemented yet.")
-    if len(encoders) != len(decoders):
-        raise ValidationError("encoders and decoders must have the same length.")
-    if not encoders:
-        raise ValidationError("at least one encoder/decoder pair is required.")
-    if validate:
-        for i, (encoder, decoder) in enumerate(zip(encoders, decoders, strict=True)):
-            if encoder.model_id != decoder.model_id:
-                raise ValidationError(
-                    f"encoder/decoder pair {i} has mismatched model ids: "
-                    f"{encoder.model_id!r} vs {decoder.model_id!r}."
-                )
-            for attr_name in (
-                "label_attr",
-                "type_attr",
-                "size_attr",
-                "time_attr",
-                "uid_attr",
-                "super_label_attr",
-                "super_uid_attr",
-                "attach_attr",
-            ):
-                if getattr(encoder, attr_name) != getattr(decoder, attr_name):
-                    raise ValidationError(
-                        f"encoder/decoder pair {i} uses inconsistent {attr_name}."
-                    )
-            _validate_pair_vocab(encoder.vocab, decoder.vocab)
-
-    model_id = f"combined:{uuid4().hex[:12]}"
-    vocab = _merge_vocabularies([encoder.vocab for encoder in encoders])
-    base_labels = frozenset().union(*(encoder.base_labels for encoder in encoders))
-
-    combined_encoder = LazyTreeEncoder(
-        model_id=model_id,
-        vocab=vocab,
-        rules=tuple(rule for encoder in encoders for rule in encoder.rules),
-        base_labels=base_labels,
-        label_attr=encoders[0].label_attr,
-        type_attr=encoders[0].type_attr,
-        size_attr=encoders[0].size_attr,
-        time_attr=encoders[0].time_attr,
-        uid_attr=encoders[0].uid_attr,
-        super_label_attr=encoders[0].super_label_attr,
-        super_uid_attr=encoders[0].super_uid_attr,
-        attach_attr=encoders[0].attach_attr,
-        encoders=encoders,
+    atomic_encoders = tuple(
+        component for encoder in encoder_inputs for component in _flatten_encoder(encoder)
     )
-    combined_decoder = LazyTreeDecoder(
-        model_id=model_id,
-        vocab=vocab,
-        base_labels=base_labels,
-        label_attr=decoders[0].label_attr,
-        type_attr=decoders[0].type_attr,
-        size_attr=decoders[0].size_attr,
-        time_attr=decoders[0].time_attr,
-        uid_attr=decoders[0].uid_attr,
-        super_label_attr=decoders[0].super_label_attr,
-        super_uid_attr=decoders[0].super_uid_attr,
-        attach_attr=decoders[0].attach_attr,
-        decoders=decoders,
+    atomic_decoders = tuple(
+        component for decoder in decoder_inputs for component in _flatten_decoder(decoder)
     )
-    return combined_encoder, combined_decoder
+    if len(atomic_encoders) != len(atomic_decoders):
+        raise CompositionError(
+            "nested combined encoder and decoder pipelines have different stage counts."
+        )
 
-
-def _validate_pair_vocab(encoder_vocab: Vocabulary, decoder_vocab: Vocabulary) -> None:
-    for token in encoder_vocab.creation_order:
-        entry = encoder_vocab.entries[token]
-        other = decoder_vocab.entries.get(token)
-        if other is None:
-            raise ValidationError(f"decoder vocabulary is missing token {token!r}.")
-        if other != entry:
-            raise ValidationError(f"encoder/decoder vocabularies disagree on token {token!r}.")
-
-
-def _merge_vocabularies(vocabs: Sequence[Vocabulary]) -> Vocabulary:
-    entries: dict[Token, VocabEntry] = {}
-    symbols: dict[Token, TokenSpec] = {}
-    order: list[Token] = []
-    for vocab in vocabs:
-        for token, spec in vocab.symbols.items():
-            previous = symbols.get(token)
-            if previous is not None and previous != spec:
-                raise ValidationError(
-                    f"incompatible symbol specification for {token!r}: "
-                    f"{previous!r} versus {spec!r}."
+    seen_ids: set[str] = set()
+    fitting_sizes: dict[object, int] = {}
+    for index, (encoder, decoder) in enumerate(zip(atomic_encoders, atomic_decoders, strict=True)):
+        _validate_pair(encoder, decoder, index=index)
+        if encoder.model_id in seen_ids:
+            raise CompositionError(
+                f"duplicate stage model ID {encoder.model_id!r} in combined pipeline."
+            )
+        seen_ids.add(encoder.model_id)
+        for label in encoder.vocab.labels:
+            size = encoder.vocab.fitting_size(label)
+            previous = fitting_sizes.get(label)
+            if previous is not None and previous != size:
+                raise CompositionError(
+                    f"combined stages assign label {label!r} fitting sizes {previous} and {size}."
                 )
-            if token in entries:
-                continue
-            symbols[token] = spec
-        for token in vocab.creation_order:
-            entry = vocab.entries[token]
-            symbols.pop(token, None)
-            if token in entries:
-                if entries[token] != entry:
-                    raise ValidationError(f"incompatible duplicate token {token!r} during combine.")
-                continue
-            entries[token] = entry
-            order.append(token)
-    return Vocabulary(entries=entries, creation_order=order, symbols=symbols)
+            fitting_sizes[label] = size
+
+    combined_id = f"combined:{uuid4().hex}"
+    encoder = CombinedTreeEncoder(model_id=combined_id, encoders=atomic_encoders)
+    decoder = CombinedTreeDecoder(
+        model_id=combined_id,
+        decoders=atomic_decoders,
+        inspection_rules=encoder.rules,
+    )
+    if encoder.vocab != decoder.vocab:
+        raise CompositionError("combined encoder and decoder vocabularies disagree.")
+    return encoder, decoder
+
+
+__all__ = ["CombinedTreeDecoder", "CombinedTreeEncoder", "combine"]

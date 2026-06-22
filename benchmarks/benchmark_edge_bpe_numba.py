@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tree_coarsening import EdgeBPECoarsener
+from tree_coarsening import EdgeBPECoarsener  # noqa: E402
 
 
 def make_path(n_nodes: int) -> nx.DiGraph:
@@ -37,8 +37,7 @@ def make_star(n_nodes: int) -> nx.DiGraph:
     graph = nx.DiGraph()
     graph.add_node(0, label="A", time=0.0, uid=0)
     graph.add_nodes_from(
-        (node, {"label": "B", "time": float(node), "uid": node})
-        for node in range(1, n_nodes)
+        (node, {"label": "B", "time": float(node), "uid": node}) for node in range(1, n_nodes)
     )
     graph.add_edges_from((0, node) for node in range(1, n_nodes))
     return graph
@@ -53,11 +52,10 @@ def timed_fit(
         backend=backend,
         num_merges=merges,
         min_pair_count=2,
-        validate_inputs=False,
         model_id="benchmark",
     )
     start = perf_counter()
-    model.fit([graph])
+    model.fit([graph], validate=False)
     return perf_counter() - start, model
 
 

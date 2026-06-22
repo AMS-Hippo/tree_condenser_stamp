@@ -1,180 +1,194 @@
-"""User-facing abstract coarsener base class."""
+"""User-facing abstract coarsener API for schema 1.0."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
-from typing import Any, Hashable, Literal
+from collections import deque
+from collections.abc import Hashable, Sequence
+from copy import deepcopy
+from typing import TypeVar
 from uuid import uuid4
 
 import networkx as nx
 
 from .decoder import TreeDecoder
 from .encoder import TreeEncoder
-from .exceptions import NotFittedError, ValidationError
-from .schema import RAW_INPUT_FLAG, GraphInput, as_graph_list, normalize_coarsenable_tree
-from .validation import validate_coarsenable_tree
-from .vocabulary import Token
+from .exceptions import ConfigurationError, NotFittedError
+from .schema import (
+    ValidationLevel,
+    fit_corpus_fitting_sizes,
+    normalize_validation_level,
+    prepare_graph,
+)
 
-DecodeBy = Literal["node", "label", "type"]
+
+_TreeCoarsenerT = TypeVar("_TreeCoarsenerT", bound="TreeCoarsener")
+
+
+def _restore_snapshot_in_place(original: object, saved: object) -> bool:
+    """Restore common mutable diagnostic values while preserving identity."""
+
+    if type(original) is not type(saved):
+        return False
+    if isinstance(original, list):
+        original[:] = deepcopy(saved)
+        return True
+    if isinstance(original, dict):
+        original.clear()
+        original.update(deepcopy(saved))
+        return True
+    if isinstance(original, set):
+        original.clear()
+        original.update(deepcopy(saved))
+        return True
+    if isinstance(original, bytearray):
+        original[:] = saved
+        return True
+    if isinstance(original, deque):
+        original.clear()
+        original.extend(deepcopy(saved))
+        return True
+    if isinstance(original, tuple):
+        # Tuple items cannot be rebound, but mutable diagnostics nested inside a
+        # tuple can still be restored recursively.
+        if len(original) != len(saved):
+            return False
+        restored_any = False
+        for original_item, saved_item in zip(original, saved, strict=True):
+            restored_any = _restore_snapshot_in_place(original_item, saved_item) or restored_any
+        return restored_any or original == saved
+    if hasattr(original, "__dict__") and hasattr(saved, "__dict__"):
+        vars(original).clear()
+        vars(original).update(deepcopy(vars(saved)))
+        return True
+    return original == saved
 
 
 class TreeCoarsener(ABC):
-    """Base class for fitted tree coarseners.
-
-    ``fit`` and ``transform`` accept either one directed tree or a sequence of
-    trees.  Subclasses always receive normalized copies satisfying the common
-    fitting contract: hashable ``label``/``type``, positive ``size``, numeric
-    ``time``, and provenance fields.  Output shape matches input shape.
-    """
+    """Base class that centralizes fit atomicity and public API behavior."""
 
     encoder_: TreeEncoder | None
     decoder_: TreeDecoder | None
 
-    def __init__(
-        self,
-        *,
-        label_attr: str = "label",
-        type_attr: str = "type",
-        size_attr: str = "size",
-        time_attr: str = "time",
-        uid_attr: str = "uid",
-        super_label_attr: str = "super_label",
-        super_uid_attr: str = "super_uids",
-        attach_attr: str = "attach_map",
-        validate_inputs: bool = True,
-        model_id: str | None = None,
-        **deprecated_kwargs: Any,
-    ) -> None:
-        if deprecated_kwargs:
-            unknown = ", ".join(sorted(deprecated_kwargs))
-            raise TypeError(f"unexpected keyword argument(s): {unknown}")
-        self.label_attr = label_attr
-        self.type_attr = type_attr
-        self.size_attr = size_attr
-        self.time_attr = time_attr
-        self.uid_attr = uid_attr
-        self.super_label_attr = super_label_attr
-        self.super_uid_attr = super_uid_attr
-        self.attach_attr = attach_attr
-        self.validate_inputs = validate_inputs
+    def __init__(self, *, model_id: str | None = None) -> None:
+        if model_id is not None and (not isinstance(model_id, str) or not model_id):
+            raise ConfigurationError("model_id must be a nonempty string or None.")
         self.model_id = model_id or f"{self.__class__.__name__}:{uuid4().hex}"
         self.encoder_ = None
         self.decoder_ = None
 
-    def _prepare_graph(self, graph: nx.DiGraph) -> nx.DiGraph:
-        prepared = normalize_coarsenable_tree(
-            graph,
-            label_attr=self.label_attr,
-            type_attr=self.type_attr,
-            size_attr=self.size_attr,
-            time_attr=self.time_attr,
-            uid_attr=self.uid_attr,
-            super_label_attr=self.super_label_attr,
-            super_uid_attr=self.super_uid_attr,
-            attach_attr=self.attach_attr,
-            copy=True,
-        )
-        if self.validate_inputs:
-            validate_coarsenable_tree(
-                prepared,
-                label_attr=self.label_attr,
-                type_attr=self.type_attr,
-                size_attr=self.size_attr,
-                time_attr=self.time_attr,
-                super_label_attr=self.super_label_attr,
-                super_uid_attr=self.super_uid_attr,
-            )
-        return prepared
+    def fit(
+        self: _TreeCoarsenerT,
+        graphs: Sequence[nx.DiGraph],
+        *,
+        validate: ValidationLevel = "full",
+    ) -> _TreeCoarsenerT:
+        state_before = self._snapshot_fit_state()
+        level = normalize_validation_level(validate)
+        try:
+            if isinstance(graphs, nx.DiGraph) or isinstance(graphs, (str, bytes, bytearray)):
+                raise TypeError("fit expects a nonempty sequence of DiGraphs, such as [graph].")
+            try:
+                graph_list = list(graphs)
+            except TypeError as exc:
+                raise TypeError("fit expects a nonempty sequence of DiGraphs.") from exc
+            if not graph_list:
+                raise ValueError("fit requires at least one graph.")
+            if any(
+                not isinstance(graph, nx.DiGraph) or graph.is_multigraph() for graph in graph_list
+            ):
+                raise TypeError("every fit input must be a non-multigraph networkx.DiGraph.")
 
-    def fit(self, graphs: GraphInput) -> "TreeCoarsener":
-        """Fit on one tree or a nonempty sequence of trees."""
-
-        graph_list, _ = as_graph_list(graphs)
-        prepared = [self._prepare_graph(graph) for graph in graph_list]
-        input_stages = {
-            bool(graph.graph.get(RAW_INPUT_FLAG, False)) for graph in prepared
-        }
-        if len(input_stages) != 1:
-            raise ValidationError(
-                "one fit call cannot mix raw trees with previously transformed "
-                "trees; fit each pipeline stage on one common graph schema."
-            )
-        encoder, decoder = self._fit(prepared)
-        self.encoder_ = encoder
-        self.decoder_ = decoder
+            prepared = tuple(prepare_graph(graph, validate=level) for graph in graph_list)
+            # This is a corpus-level schema invariant, not a method-specific
+            # concern. Keeping it here avoids burdening every simple coarsener.
+            fit_corpus_fitting_sizes(prepared)
+            encoder, decoder = self._fit(prepared)
+            self._validate_artifact_pair(encoder, decoder)
+            self.encoder_ = encoder
+            self.decoder_ = decoder
+        except Exception:
+            self._restore_fit_state(state_before)
+            raise
         return self
+
+    def _snapshot_fit_state(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Capture fitted state and public diagnostics for atomic refits.
+
+        Fitted artifacts are retained by identity. Conventional public fitted
+        diagnostics ending in ``_`` are deep-copied so both reassignment and
+        in-place mutation can be rolled back.
+        """
+
+        state = dict(vars(self))
+        diagnostic_values: dict[str, object] = {}
+        for name, value in state.items():
+            if name in {"encoder_", "decoder_"} or not name.endswith("_"):
+                continue
+            try:
+                diagnostic_values[name] = deepcopy(value)
+            except Exception:
+                # Uncopyable custom diagnostics can still be restored after
+                # reassignment through the shallow state snapshot. Their own
+                # in-place mutation is outside what Python can generically undo.
+                continue
+        return state, diagnostic_values
+
+    def _restore_fit_state(
+        self,
+        snapshot: tuple[dict[str, object], dict[str, object]],
+    ) -> None:
+        state, diagnostic_values = snapshot
+        vars(self).clear()
+        vars(self).update(state)
+        for name, saved_value in diagnostic_values.items():
+            original = state[name]
+            if not _restore_snapshot_in_place(original, saved_value):
+                setattr(self, name, saved_value)
 
     def transform(
         self,
-        graphs: GraphInput,
+        graph: nx.DiGraph,
         *,
-        validate: bool = True,
-    ) -> nx.DiGraph | list[nx.DiGraph]:
-        """Encode one tree or a sequence, preserving the input container shape."""
-
+        validate: ValidationLevel = "full",
+    ) -> nx.DiGraph:
         if self.encoder_ is None:
-            raise NotFittedError("Call fit before transform.")
-        graph_list, was_single = as_graph_list(graphs, argument_name="graphs")
-        outputs = [
-            self.encoder_.encode(self._prepare_graph(graph), validate=validate)
-            for graph in graph_list
-        ]
-        return outputs[0] if was_single else outputs
+            raise NotFittedError("call fit before transform.")
+        return self.encoder_.transform(graph, validate=validate)
 
     def fit_transform(
         self,
-        graphs: GraphInput,
+        graphs: Sequence[nx.DiGraph],
         *,
-        validate: bool = True,
-    ) -> nx.DiGraph | list[nx.DiGraph]:
-        """Fit and transform one tree or a sequence of trees."""
-
-        self.fit(graphs)
-        return self.transform(graphs, validate=validate)
+        validate: ValidationLevel = "full",
+    ) -> list[nx.DiGraph]:
+        state_before = self._snapshot_fit_state()
+        try:
+            if isinstance(graphs, nx.DiGraph) or isinstance(graphs, (str, bytes, bytearray)):
+                raise TypeError("fit_transform expects a nonempty sequence of DiGraphs.")
+            graph_list = list(graphs)
+            self.fit(graph_list, validate=validate)
+            return [self.transform(graph, validate=validate) for graph in graph_list]
+        except Exception:
+            self._restore_fit_state(state_before)
+            raise
 
     def decode(
         self,
-        graphs: GraphInput,
+        graph: nx.DiGraph,
         *,
-        target: Hashable | Token | None = None,
-        by: DecodeBy = "node",
+        target: Hashable | None = None,
+        by: str = "node",
         recursive: bool = True,
-        boundary_policy: Literal["expand", "raise"] = "expand",
-        validate: bool = True,
-    ) -> nx.DiGraph | list[nx.DiGraph]:
-        """Decode one tree or a sequence, preserving the input container shape."""
-
+        boundary_policy: str = "expand",
+        validate: ValidationLevel = "full",
+    ) -> nx.DiGraph:
         if self.decoder_ is None:
-            raise NotFittedError("Call fit before decode.")
-        graph_list, was_single = as_graph_list(graphs, argument_name="graphs")
-        outputs = [
-            self.decoder_.decode(
-                graph,
-                target=target,
-                by=by,
-                recursive=recursive,
-                boundary_policy=boundary_policy,
-                validate=validate,
-            )
-            for graph in graph_list
-        ]
-        return outputs[0] if was_single else outputs
-
-    def inverse_transform(
-        self,
-        graphs: GraphInput,
-        *,
-        target: Hashable | Token | None = None,
-        by: DecodeBy = "node",
-        recursive: bool = True,
-        boundary_policy: Literal["expand", "raise"] = "expand",
-        validate: bool = True,
-    ) -> nx.DiGraph | list[nx.DiGraph]:
-        """Alias for ``decode`` using transformer-style naming."""
-
-        return self.decode(
-            graphs,
+            raise NotFittedError("call fit before decode.")
+        return self.decoder_.decode(
+            graph,
             target=target,
             by=by,
             recursive=recursive,
@@ -182,13 +196,38 @@ class TreeCoarsener(ABC):
             validate=validate,
         )
 
-    def fit_artifacts(self, graphs: GraphInput) -> tuple[TreeEncoder, TreeDecoder]:
-        """Fit and return ``(encoder, decoder)`` directly."""
+    def inverse_transform(
+        self,
+        graph: nx.DiGraph,
+        *,
+        target: Hashable | None = None,
+        by: str = "node",
+        recursive: bool = True,
+        boundary_policy: str = "expand",
+        validate: ValidationLevel = "full",
+    ) -> nx.DiGraph:
+        return self.decode(
+            graph,
+            target=target,
+            by=by,
+            recursive=recursive,
+            boundary_policy=boundary_policy,
+            validate=validate,
+        )
 
-        self.fit(graphs)
-        assert self.encoder_ is not None and self.decoder_ is not None
-        return self.encoder_, self.decoder_
+    def _validate_artifact_pair(self, encoder: TreeEncoder, decoder: TreeDecoder) -> None:
+        if not isinstance(encoder, TreeEncoder) or not isinstance(decoder, TreeDecoder):
+            raise ConfigurationError("_fit must return (TreeEncoder, TreeDecoder).")
+        if encoder.model_id != decoder.model_id or encoder.model_id != self.model_id:
+            raise ConfigurationError("coarsener, encoder, and decoder model IDs must agree.")
+        if encoder.rules != decoder.rules:
+            raise ConfigurationError("paired encoder and decoder rules must be identical.")
+        if encoder.vocab != decoder.vocab:
+            raise ConfigurationError("paired encoder and decoder vocabularies must be identical.")
 
     @abstractmethod
-    def _fit(self, graphs: Sequence[nx.DiGraph]) -> tuple[TreeEncoder, TreeDecoder]:
-        """Subclass implementation for fitting normalized trees."""
+    def _fit(
+        self,
+        graphs: Sequence[nx.DiGraph],
+    ) -> tuple[TreeEncoder, TreeDecoder]:
+        """Construct new fitted artifacts without mutating existing state."""

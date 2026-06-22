@@ -1,67 +1,60 @@
-# Experimental Numba backend for edge BPE
+# Optional Numba backend for Edge BPE
 
-`EdgeBPECoarsener` accepts:
+`EdgeBPECoarsener` has a reference Python fitter and an optional compiled
+Numba fitter:
 
 ```python
 EdgeBPECoarsener(..., backend="python")  # default
-EdgeBPECoarsener(..., backend="numba")   # optional experiment
+EdgeBPECoarsener(..., backend="numba")
 ```
 
-Install the optional dependency with:
+Install the optional dependencies with:
 
 ```bash
 pip install -e ".[numba]"
 ```
 
-## Scope
+## Shared semantics
 
-The experimental backend accelerates fitting only. It compiles:
+Both fitters use only the current matching-label pair:
 
-- a flattened forest representation based on NumPy arrays;
-- the incremental edge-pair occurrence index;
-- local pair-count updates during in-place edge contraction.
+```python
+(parent_node["label"], child_node["label"])
+```
 
-The following remain Python:
+They must agree on:
 
-- validation and NetworkX preprocessing;
-- deterministic candidate sorting;
-- vocabulary and rule construction;
-- `transform` and decoding.
+- raw matching-edge frequency, including overlapping occurrences;
+- `count`, `normalized`, and `size_weighted` scores;
+- deterministic score ties and vertex-disjoint overlap selection;
+- ordered rules, raw counts, and actual contraction-event counts;
+- additive output fitting size.
 
-The fitted rules, raw matching-edge scores, deterministic contraction order,
-and encoder/decoder artifacts are intended to be identical to the Python
-backend.
+Size-aware scores use label-level fitting sizes, not occurrence-specific exact
+node sizes. Exact types and attachment maps are intentionally absent from the
+fitting pair index.
 
-## Why a separate implementation is needed
+## Compiled state
 
-The Python backend indexes occurrences as a dictionary from an edge-key triple
-to a set of child indices. That representation is convenient in Python but is
-not a good Numba boundary. The compiled backend therefore uses:
+The protected Numba kernel uses flattened arrays for parent/child/sibling
+links, integer label IDs, fitting sizes, times, liveness, tree IDs, and local
+pair-bucket maintenance. Contractions update affected pair buckets instead of
+recounting the whole forest.
 
-- fixed NumPy arrays for parent, child/sibling links, label, time, attachment,
-  and liveness;
-- a compiled dictionary from edge keys to integer bucket IDs;
-- linked occurrence lists represented by integer arrays;
-- dynamic bucket metadata represented by typed integer lists.
+Only fitting is compiled. Raw/schema normalization, stable tie resolution,
+artifact construction, NetworkX transformation, exact type creation, and
+decoding remain at the Python boundary.
 
-This is materially more code than adding `@njit` to the existing methods.
+## Warm-up and benchmark
 
-## Benchmarking
-
-Run:
+The first Numba call may include JIT compilation. Benchmark first-call and
+warmed behavior separately:
 
 ```bash
 python benchmarks/benchmark_edge_bpe_numba.py path --nodes 100000
 python benchmarks/benchmark_edge_bpe_numba.py star --nodes 100000
 ```
 
-The script reports the Python fit, the first Numba fit, and a second warmed
-Numba fit. The first fit includes compilation unless a usable disk cache is
-already present. To force a cold compilation, set `NUMBA_CACHE_DIR` to a new
-empty directory before running the script.
-
-## Status
-
-This backend is experimental and is not the default. It is most plausible for
-large fits or repeated fits in one long-running process. For small jobs and
-interactive tests, JIT startup can cost more than the compiled kernel saves.
+The cross-generation parity and timing audit is recorded in
+`audit/BPE_PARITY_AND_PERFORMANCE.md`. The complete Numba source is also
+byte-protected against the v0.12.1 baseline.

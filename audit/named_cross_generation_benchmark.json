@@ -1,0 +1,42 @@
+{
+  "environment": {
+    "platform": "Linux-4.4.0-x86_64-with-glibc2.41",
+    "python": "3.13.5"
+  },
+  "repetitions": 5,
+  "rows": [
+    {
+      "decode_ratio": 1.0553642603644162,
+      "encoded_nodes": 201,
+      "groups": 100,
+      "nodes": 601,
+      "schema1_decode_seconds": 0.0250334259999363,
+      "schema1_transform_seconds": 0.029680570999971678,
+      "transform_ratio": 0.9156086649061482,
+      "v0_12_1_decode_seconds": 0.02372017599998344,
+      "v0_12_1_transform_seconds": 0.0324162190000834
+    },
+    {
+      "decode_ratio": 0.9433991542336791,
+      "encoded_nodes": 1001,
+      "groups": 500,
+      "nodes": 3001,
+      "schema1_decode_seconds": 0.1291733990000239,
+      "schema1_transform_seconds": 0.15835338599993065,
+      "transform_ratio": 0.8920857958724733,
+      "v0_12_1_decode_seconds": 0.13692337800000587,
+      "v0_12_1_transform_seconds": 0.17750914400005513
+    },
+    {
+      "decode_ratio": 0.7080467093843937,
+      "encoded_nodes": 2001,
+      "groups": 1000,
+      "nodes": 6001,
+      "schema1_decode_seconds": 0.26352320900002724,
+      "schema1_transform_seconds": 0.306506507999984,
+      "transform_ratio": 0.7158885920131012,
+      "v0_12_1_decode_seconds": 0.37218336800003726,
+      "v0_12_1_transform_seconds": 0.4281483339999568
+    }
+  ]
+}

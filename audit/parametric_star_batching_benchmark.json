@@ -1,0 +1,46 @@
+{
+  "environment": {
+    "python": "3.13.5",
+    "platform": "Linux-4.4.0-x86_64-with-glibc2.41",
+    "networkx": "3.6.1"
+  },
+  "validation": "full",
+  "repetitions": 3,
+  "rows": [
+    {
+      "groups": 50,
+      "nodes": 151,
+      "batched_seconds": 0.004523449999396689,
+      "sequential_seconds": 0.05397722599991539,
+      "speedup": 11.932756194301817
+    },
+    {
+      "groups": 100,
+      "nodes": 301,
+      "batched_seconds": 0.00938960399980715,
+      "sequential_seconds": 0.2113627999988239,
+      "speedup": 22.510299689227043
+    },
+    {
+      "groups": 200,
+      "nodes": 601,
+      "batched_seconds": 0.01998511900092126,
+      "sequential_seconds": 0.8831092869986605,
+      "speedup": 44.18834268427182
+    },
+    {
+      "groups": 400,
+      "nodes": 1201,
+      "batched_seconds": 0.04391068799850473,
+      "sequential_seconds": 3.6622466019998683,
+      "speedup": 83.40216855915756
+    },
+    {
+      "groups": 533,
+      "nodes": 1600,
+      "batched_seconds": 0.06676037899887888,
+      "sequential_seconds": 6.208720685999651,
+      "speedup": 93.00008147203472
+    }
+  ]
+}

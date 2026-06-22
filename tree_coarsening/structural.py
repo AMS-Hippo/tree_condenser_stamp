@@ -1,137 +1,167 @@
-"""Exact structural types and fitting-alphabet metadata.
+"""Occurrence-specific exact structural types for schema 1.0.
 
-Fitting uses node ``label`` values as opaque symbols.  Decoding uses exact
-``type`` values.  A :class:`CompositeType` is an immutable, self-contained
-recipe for one transformed occurrence, including component labels/types,
-component sizes/root counts, topology, and occurrence-specific attachment
-sites.
+Matching labels are deliberately opaque. All geometry required for rewiring
+and decoding lives in :class:`CompositeType` occurrences.
 """
 
 from __future__ import annotations
 
-from collections.abc import Hashable as HashableABC, Mapping, Sequence
+from collections.abc import Hashable as HashableABC, Iterator
 from dataclasses import dataclass
-from typing import Any, Hashable, Literal
+from typing import Any, Hashable, Literal, TypeAlias
 
-import networkx as nx
+from .exceptions import ExactTypeError
 
-from .exceptions import ValidationError
-from .vocabulary import AttachMap, Token, TokenSpec, Vocabulary, is_base_token, normalize_attach_map
+MatchingLabel: TypeAlias = Hashable
+BaseType: TypeAlias = tuple[Literal["base"], str]
+AttachMap: TypeAlias = tuple[int, ...]
 
-CompositeKind = Literal["edge_bpe", "star", "component"]
+
+def _require_hashable(value: Any, *, what: str) -> None:
+    if not isinstance(value, HashableABC):
+        raise ExactTypeError(f"{what} must be hashable; got {value!r}.")
+    try:
+        hash(value)
+    except Exception as exc:
+        raise ExactTypeError(f"{what} cannot be hashed reliably: {value!r}.") from exc
+
+
+def base_type(raw_label: str) -> BaseType:
+    """Return the exact type of one raw node label."""
+
+    if not isinstance(raw_label, str):
+        raise ExactTypeError(f"raw base labels must be strings; got {raw_label!r}.")
+    return ("base", raw_label)
+
+
+def is_base_type(value: Any) -> bool:
+    return (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and value[0] == "base"
+        and isinstance(value[1], str)
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class CompositeType:
-    """Exact recipe for one transformed node occurrence.
-
-    ``label`` is the generic symbol seen by later fitting stages.  The remaining
-    fields describe the exact structural variant needed to undo this stage.
-    """
+    """Exact immutable recipe for one contracted occurrence."""
 
     model_id: str
-    kind: CompositeKind
-    label: Token
+    label: MatchingLabel
     parent: tuple[int, ...]
-    component_labels: tuple[Token, ...]
-    component_types: tuple[Token, ...]
-    component_sizes: tuple[int, ...]
-    component_root_counts: tuple[int, ...]
+    components: tuple["ExactType", ...]
     attach: tuple[int, ...]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model_id, str) or not self.model_id:
+            raise ExactTypeError("CompositeType.model_id must be a nonempty string.")
+        _require_hashable(self.label, what="CompositeType.label")
+        if not isinstance(self.parent, tuple):
+            raise ExactTypeError("CompositeType.parent must be a tuple.")
+        if not isinstance(self.components, tuple):
+            raise ExactTypeError("CompositeType.components must be a tuple.")
+        if not isinstance(self.attach, tuple):
+            raise ExactTypeError("CompositeType.attach must be a tuple.")
+
         n = len(self.parent)
-        if not self.model_id:
-            raise ValidationError("CompositeType.model_id must be nonempty.")
-        if self.kind not in {"edge_bpe", "star", "component"}:
-            raise ValidationError(f"unknown composite kind {self.kind!r}.")
-        if not isinstance(self.label, HashableABC):
-            raise ValidationError(f"composite label must be hashable; got {self.label!r}.")
         if n == 0:
-            raise ValidationError("composite types require at least one component.")
-        if not (
-            len(self.component_labels)
-            == len(self.component_types)
-            == len(self.component_sizes)
-            == len(self.component_root_counts)
-            == n
-        ):
-            raise ValidationError("all CompositeType component vectors must have equal length.")
-        for i, p in enumerate(self.parent):
-            if not isinstance(p, int) or isinstance(p, bool) or p < -1 or p >= n or p == i:
-                raise ValidationError(f"invalid composite parent[{i}]={p!r}.")
-        for i, token in enumerate(self.component_labels):
-            if not isinstance(token, HashableABC):
-                raise ValidationError(f"component label {i} is not hashable: {token!r}.")
-        for i, token in enumerate(self.component_types):
-            if not isinstance(token, HashableABC):
-                raise ValidationError(f"component type {i} is not hashable: {token!r}.")
-        for i, size in enumerate(self.component_sizes):
-            if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
-                raise ValidationError(f"component size {i} must be positive; got {size!r}.")
-        for i, roots in enumerate(self.component_root_counts):
-            if not isinstance(roots, int) or isinstance(roots, bool) or roots <= 0:
-                raise ValidationError(
-                    f"component root count {i} must be positive; got {roots!r}."
-                )
-        if not all(isinstance(q, int) and not isinstance(q, bool) for q in self.attach):
-            raise ValidationError("CompositeType.attach must be a flat integer tuple.")
+            raise ExactTypeError("CompositeType requires at least one component.")
+        if len(self.components) != n:
+            raise ExactTypeError(
+                "CompositeType.parent and CompositeType.components must have equal length."
+            )
+        for i, parent_i in enumerate(self.parent):
+            if (
+                not isinstance(parent_i, int)
+                or isinstance(parent_i, bool)
+                or parent_i < -1
+                or parent_i >= n
+                or parent_i == i
+            ):
+                raise ExactTypeError(f"invalid CompositeType.parent[{i}]={parent_i!r}.")
         self._check_parent_acyclic()
 
+        for i, component in enumerate(self.components):
+            if not is_exact_type(component):
+                raise ExactTypeError(f"component {i} is not a valid exact type: {component!r}.")
+        for i, value in enumerate(self.attach):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ExactTypeError(
+                    f"CompositeType.attach[{i}] must be an integer; got {value!r}."
+                )
+
         expected = sum(
-            self.component_root_counts[i]
-            for i, p in enumerate(self.parent)
-            if p >= 0
+            exact_root_count(self.components[i])
+            for i, parent_i in enumerate(self.parent)
+            if parent_i != -1
         )
         if len(self.attach) != expected:
-            raise ValidationError(
-                f"composite type stores {len(self.attach)} attachment values; expected {expected}."
+            raise ExactTypeError(
+                f"CompositeType.attach has length {len(self.attach)}; expected {expected}."
             )
-        for i, p in enumerate(self.parent):
-            if p < 0:
+
+        cursor = 0
+        for i, parent_i in enumerate(self.parent):
+            if parent_i == -1:
                 continue
-            parent_sites = self.component_sizes[p]
-            bad = [q for q in self.attachment_slice(i) if q < 0 or q >= parent_sites]
+            width = exact_root_count(self.components[i])
+            parent_size = exact_site_count(self.components[parent_i])
+            piece = self.attach[cursor : cursor + width]
+            cursor += width
+            bad = tuple(q for q in piece if q < 0 or q >= parent_size)
             if bad:
-                raise ValidationError(
-                    f"component {i} has attachment sites {bad!r} outside 0..{parent_sites - 1}."
+                raise ExactTypeError(
+                    f"component {i} attaches to invalid sites {bad!r}; "
+                    f"parent component {parent_i} has {parent_size} sites."
                 )
 
     @property
     def n_components(self) -> int:
-        return len(self.parent)
+        return len(self.components)
+
+    @property
+    def root_positions(self) -> tuple[int, ...]:
+        return tuple(i for i, parent_i in enumerate(self.parent) if parent_i == -1)
 
     @property
     def site_count(self) -> int:
-        return sum(self.component_sizes)
+        return sum(exact_site_count(component) for component in self.components)
 
     @property
     def root_count(self) -> int:
         return sum(
-            self.component_root_counts[i]
-            for i, p in enumerate(self.parent)
-            if p == -1
+            exact_root_count(self.components[i])
+            for i, parent_i in enumerate(self.parent)
+            if parent_i == -1
         )
 
-    @property
-    def root_positions(self) -> tuple[int, ...]:
-        return tuple(i for i, p in enumerate(self.parent) if p == -1)
-
-    def attachment_slice(self, i: int) -> AttachMap:
-        if i < 0 or i >= self.n_components:
-            raise IndexError(i)
-        if self.parent[i] == -1:
+    def attachment_slice(self, component_index: int) -> AttachMap:
+        if component_index < 0 or component_index >= self.n_components:
+            raise IndexError(component_index)
+        if self.parent[component_index] == -1:
             return ()
-        start = sum(
-            self.component_root_counts[h]
-            for h in range(i)
-            if self.parent[h] >= 0
-        )
-        stop = start + self.component_root_counts[i]
-        return tuple(self.attach[start:stop])
+        cursor = 0
+        for i, parent_i in enumerate(self.parent):
+            if parent_i == -1:
+                continue
+            width = exact_root_count(self.components[i])
+            if i == component_index:
+                return tuple(self.attach[cursor : cursor + width])
+            cursor += width
+        raise AssertionError("unreachable")
 
     def attachment_slices(self) -> tuple[AttachMap, ...]:
-        return tuple(self.attachment_slice(i) for i in range(self.n_components))
+        out: list[AttachMap] = []
+        cursor = 0
+        for i, parent_i in enumerate(self.parent):
+            if parent_i == -1:
+                out.append(())
+                continue
+            width = exact_root_count(self.components[i])
+            out.append(tuple(self.attach[cursor : cursor + width]))
+            cursor += width
+        return tuple(out)
 
     def _check_parent_acyclic(self) -> None:
         state = bytearray(len(self.parent))
@@ -139,110 +169,76 @@ class CompositeType:
             if state[start] == 2:
                 continue
             path: list[int] = []
-            cur = start
-            while cur != -1 and state[cur] == 0:
-                state[cur] = 1
-                path.append(cur)
-                cur = self.parent[cur]
-            if cur != -1 and state[cur] == 1:
-                raise ValidationError("CompositeType parent relation is cyclic.")
-            for node in path:
-                state[node] = 2
+            current = start
+            while current != -1 and state[current] == 0:
+                state[current] = 1
+                path.append(current)
+                current = self.parent[current]
+            if current != -1 and state[current] == 1:
+                raise ExactTypeError("CompositeType.parent contains a cycle.")
+            for item in path:
+                state[item] = 2
 
 
-def structural_site_count(type_token: Token, vocab: Vocabulary | None = None) -> int:
-    """Return an exact type's number of represented sites."""
+ExactType: TypeAlias = BaseType | CompositeType
 
-    if isinstance(type_token, CompositeType):
-        return type_token.site_count
-    if is_base_token(type_token):
+
+def is_exact_type(value: Any) -> bool:
+    return is_base_type(value) or isinstance(value, CompositeType)
+
+
+def exact_type_label(value: ExactType) -> MatchingLabel:
+    if is_base_type(value):
+        return value[1]
+    if isinstance(value, CompositeType):
+        return value.label
+    raise ExactTypeError(f"not an exact type: {value!r}.")
+
+
+def exact_site_count(value: ExactType) -> int:
+    if is_base_type(value):
         return 1
-    if vocab is not None and type_token in vocab:
-        return vocab.site_count(type_token)
-    raise ValidationError(f"cannot determine site count for structural type {type_token!r}.")
+    if isinstance(value, CompositeType):
+        return value.site_count
+    raise ExactTypeError(f"not an exact type: {value!r}.")
 
 
-def structural_root_count(type_token: Token, vocab: Vocabulary | None = None) -> int:
-    """Return an exact type's number of exposed roots."""
-
-    if isinstance(type_token, CompositeType):
-        return type_token.root_count
-    if is_base_token(type_token):
+def exact_root_count(value: ExactType) -> int:
+    if is_base_type(value):
         return 1
-    if vocab is not None and type_token in vocab:
-        return vocab.root_count(type_token)
-    raise ValidationError(f"cannot determine root count for structural type {type_token!r}.")
+    if isinstance(value, CompositeType):
+        return value.root_count
+    raise ExactTypeError(f"not an exact type: {value!r}.")
 
 
-def infer_input_alphabet(
-    graphs: Sequence[nx.DiGraph],
-    *,
-    label_attr: str = "label",
-    type_attr: str = "type",
-    size_attr: str = "size",
-    attach_attr: str = "attach_map",
-) -> dict[Token, TokenSpec]:
-    """Infer and validate fixed size/root metadata for fitting labels.
-
-    A label is a BPE/star symbol and therefore must have one stable expanded
-    size and root count throughout a fitted corpus.  Exact attachment variants
-    may differ while preserving this specification.
-    """
-
-    specs: dict[Token, TokenSpec] = {}
-    for graph in graphs:
-        roots = [node for node in graph if graph.in_degree(node) == 0]
-        if len(roots) != 1:
-            raise ValidationError(f"expected one root while inferring alphabet; found {len(roots)}.")
-        root = roots[0]
-        for node, data in graph.nodes(data=True):
-            label = data[label_attr]
-            type_token = data[type_attr]
-            size = int(data[size_attr])
-            try:
-                root_count = structural_root_count(type_token)
-            except ValidationError:
-                if node == root:
-                    root_count = 1
-                else:
-                    parent = next(graph.predecessors(node))
-                    root_count = len(normalize_attach_map(graph.edges[parent, node][attach_attr]))
-            spec = TokenSpec(site_count=size, root_count=root_count)
-            previous = specs.get(label)
-            if previous is None:
-                specs[label] = spec
-            elif previous != spec:
-                raise ValidationError(
-                    f"fitting label {label!r} has inconsistent specifications: "
-                    f"{previous!r} versus {spec!r}. Use distinct labels for symbols "
-                    "with different size/root counts."
-                )
-    return specs
+def iter_exact_types(value: ExactType) -> Iterator[ExactType]:
+    stack: list[ExactType] = [value]
+    while stack:
+        current = stack.pop()
+        yield current
+        if isinstance(current, CompositeType):
+            stack.extend(reversed(current.components))
 
 
-def component_super_labels(
-    value: Any,
-    *,
-    component_sizes: Sequence[int],
-    flat_uids: Sequence[Any],
-) -> tuple[Any, ...]:
-    """Return recipe-aligned component provenance with a flat fallback."""
+def iter_base_labels(value: ExactType) -> Iterator[str]:
+    """Yield raw base labels in exact site order without recursive calls."""
 
-    if (
-        isinstance(value, Sequence)
-        and not isinstance(value, (str, bytes, bytearray))
-        and len(value) == len(component_sizes)
-    ):
-        return tuple(value)
+    stack: list[ExactType] = [value]
+    while stack:
+        current = stack.pop()
+        if is_base_type(current):
+            yield current[1]
+        elif isinstance(current, CompositeType):
+            stack.extend(reversed(current.components))
+        else:  # pragma: no cover - callers validate exact types first
+            raise ExactTypeError(f"not an exact type: {current!r}.")
 
-    pieces: list[Any] = []
-    cursor = 0
-    for size in component_sizes:
-        piece = tuple(flat_uids[cursor : cursor + size])
-        pieces.append(piece[0] if size == 1 else piece)
-        cursor += size
-    if cursor != len(flat_uids):
-        raise ValidationError(
-            f"component sizes consume {cursor} UIDs, but occurrence stores {len(flat_uids)}."
-        )
-    return tuple(pieces)
+
+def exact_type_labels(value: ExactType) -> frozenset[MatchingLabel]:
+    return frozenset(exact_type_label(item) for item in iter_exact_types(value))
+
+
+def exact_type_model_ids(value: ExactType) -> frozenset[str]:
+    return frozenset(
+        item.model_id for item in iter_exact_types(value) if isinstance(item, CompositeType)
+    )
